@@ -16,7 +16,9 @@ sys.dont_write_bytecode = True
 
 import avb
 import cs
-from layout import BY_NAME, IMAGES, Image, Part
+from layout import (
+    BY_NAME, IMAGES, KEY_IMAGE, SIGNING_TYPE, VBMETA_IMAGE, Image, Part,
+)
 
 
 def sha256(data: bytes) -> str:
@@ -27,7 +29,7 @@ def fw_version(images: dict[str, bytes]) -> str:
     pattern = re.compile(rb"(?<![A-Z0-9])[A-Z][0-9]{3}[A-Z][A-Z0-9]{8}(?![A-Z0-9])")
     versions = set()
     for img in IMAGES:
-        if img.name == "up_param.bin":
+        if not img.version:
             continue
         found = {item.decode("ascii") for item in pattern.findall(images[img.name])}
         if len(found) != 1:
@@ -62,8 +64,8 @@ def _members(path: Path) -> dict[str, bytes]:
     if not path.is_dir():
         raise ValueError(f"source does not exist: {path}")
     roots = [path]
-    roots.extend(item.parent for item in path.rglob("fld.bin.lz4"))
-    roots.extend(item.parent for item in path.rglob("fld.bin"))
+    roots.extend(item.parent for item in path.rglob(f"{KEY_IMAGE}.lz4"))
+    roots.extend(item.parent for item in path.rglob(KEY_IMAGE))
     valid = []
     for root in dict.fromkeys(roots):
         raw = all((root / img.name).is_file() for img in IMAGES)
@@ -157,11 +159,11 @@ def _sign_part(data: bytearray, part: Part, keys: cs.Keys,
     if part.avb_keys:
         cs.replace_avb_keys(data, keys.avb_pub)
     if part.stage == "st1":
-        cs.sign_st1(data, keys, rb)
+        cs.sign_st1(data, keys, rb, SIGNING_TYPE)
     elif part.stage == "st2":
         if part.key is None:
             raise ValueError(f"missing key mode for {part.name}")
-        cs.sign_st2(data, keys, part.key, part.header, rb)
+        cs.sign_st2(data, keys, part.key, part.header, rb, SIGNING_TYPE)
 
 
 def _check_index(rec: dict, keys: cs.Keys | None, mode: str) -> None:
@@ -177,7 +179,7 @@ def _build(root: Path, keys: cs.Keys, rb: int | None) -> dict[str, bytes]:
     sizes = {name: int(item["size"]) for name, item in meta["images"].items()}
     images = {}
     for img in IMAGES:
-        if img.name == "vbmeta.img":
+        if img.name == VBMETA_IMAGE:
             continue
         data = _read(root, img, sizes[img.name])
         if img.parts:
@@ -190,7 +192,7 @@ def _build(root: Path, keys: cs.Keys, rb: int | None) -> dict[str, bytes]:
         if img.stage == "st2":
             if img.key is None:
                 raise ValueError(f"missing key mode for {img.name}")
-            cs.sign_st2(data, keys, img.key, False, rb)
+            cs.sign_st2(data, keys, img.key, False, rb, SIGNING_TYPE)
         images[img.name] = bytes(data)
 
     updates = {}
@@ -201,10 +203,10 @@ def _build(root: Path, keys: cs.Keys, rb: int | None) -> dict[str, bytes]:
         updates[img.avb] = avb.wrap(data, keys.avb, keys.avb_pub, img.avb)
         images[img.name] = bytes(data)
 
-    vbmeta = _read(root, BY_NAME["vbmeta.img"], sizes["vbmeta.img"])
+    vbmeta = _read(root, BY_NAME[VBMETA_IMAGE], sizes[VBMETA_IMAGE])
     avb.update_top(vbmeta, keys.avb, keys.avb_pub, updates)
-    cs.sign_st2(vbmeta, keys, "ree", False, rb)
-    images["vbmeta.img"] = bytes(vbmeta)
+    cs.sign_st2(vbmeta, keys, "ree", False, rb, SIGNING_TYPE)
+    images[VBMETA_IMAGE] = bytes(vbmeta)
     return images
 
 
@@ -228,8 +230,8 @@ def _mode(img: Image, part: Part | None = None) -> str:
 
 def check(images: dict[str, bytes], keys: cs.Keys | None = None) -> dict:
     _check(images)
-    fld = images["fld.bin"]
-    stock_tee, stock_ree = cs.stock_keys(fld)
+    fld = images[KEY_IMAGE]
+    stock_tee, stock_ree = cs.stock_keys(fld, SIGNING_TYPE)
     tee = keys.tee.public_key() if keys else stock_tee
     ree = keys.ree.public_key() if keys else stock_ree
     info = {"version": fw_version(images), "images": {}}
@@ -247,10 +249,12 @@ def check(images: dict[str, bytes], keys: cs.Keys | None = None) -> dict:
             raw = data[part.start:part.end]
             rec = {"name": part.name, "size": len(raw), "mode": _mode(img, part)}
             if part.stage == "st1":
-                rec.update(cs.verify_st1(raw, keys))
+                rec.update(cs.verify_st1(raw, keys, SIGNING_TYPE))
             elif part.stage == "st2":
                 pub = tee if part.key == "tee" else ree
-                rec.update(cs.verify_st2(raw, pub, part.key or "", part.header))
+                rec.update(cs.verify_st2(
+                    raw, pub, part.key or "", part.header, SIGNING_TYPE
+                ))
                 _check_index(rec, keys, part.key or "")
             if part.avb_keys and keys is not None:
                 check = bytearray(raw)
@@ -259,10 +263,13 @@ def check(images: dict[str, bytes], keys: cs.Keys | None = None) -> dict:
                     raise ValueError("keystorage AVB keys were not replaced")
             item["parts"].append(rec)
         if img.stage == "st2":
-            item.update(cs.verify_st2(data, ree if img.key == "ree" else tee, img.key or ""))
+            item.update(cs.verify_st2(
+                data, ree if img.key == "ree" else tee,
+                img.key or "", False, SIGNING_TYPE
+            ))
             _check_index(item, keys, img.key or "")
-        if img.name == "vbmeta.img":
-            item.update(cs.verify_st2(data, ree, "ree"))
+        if img.name == VBMETA_IMAGE:
+            item.update(cs.verify_st2(data, ree, "ree", False, SIGNING_TYPE))
             _check_index(item, keys, "ree")
         if img.avb:
             pub = keys.avb_pub if keys else None
@@ -270,10 +277,10 @@ def check(images: dict[str, bytes], keys: cs.Keys | None = None) -> dict:
             item["avb"] = "SHA256_RSA4096"
         info["images"][img.name] = item
 
-    vbmeta = images["vbmeta.img"]
+    vbmeta = images[VBMETA_IMAGE]
     top_pub = keys.avb_pub if keys else avb.public(vbmeta)
     avb.verify_top(vbmeta, top_pub, updates)
-    info["images"]["vbmeta.img"]["avb"] = "SHA256_RSA4096"
+    info["images"][VBMETA_IMAGE]["avb"] = "SHA256_RSA4096"
     info["ok"] = True
     return info
 

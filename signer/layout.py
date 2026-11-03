@@ -1,4 +1,10 @@
+import json
 from dataclasses import dataclass
+from pathlib import Path
+
+
+def number(value):
+    return int(value, 0) if isinstance(value, str) else value
 
 
 @dataclass(frozen=True)
@@ -23,74 +29,34 @@ class Image:
     key: str | None = "ree"
     avb: str | None = None
     parts: tuple[Part, ...] = ()
+    bundle: bool = True
+    version: bool = True
 
 
-# This is ONLYY FOR s5e8825
-IMAGES = (
-    Image(
-        "fld.bin",
-        avb="fld",
-        parts=(
-            Part("bl1.bin", 0, 0x3000, "st1"),
-            Part("tail.bin", 0x3000, None),
-        ),
-    ),
-    Image(
-        "harx.bin",
-        avb="harx",
-        parts=(
-            Part("harx.bin", 0, 0x200000, "st2", "ree"),
-            Part("tail.bin", 0x200000, None),
-        ),
-    ),
-    Image(
-        "keystorage.bin",
-        avb="keystorage",
-        parts=(
-            Part("keystorage.bin", 0, 0x4000, "st2", "tee", avb_keys=True),
-            Part("tail.bin", 0x4000, None),
-        ),
-    ),
-    Image(
-        "ldfw.img",
-        avb="ldfw",
-        parts=(
-            Part("ldfw.bin", 0, 0x3FC000, "st2", "tee"),
-            Part("tail.bin", 0x3FC000, None),
-        ),
-    ),
-    Image(
-        "sboot.bin",
-        avb="bootloader",
-        parts=(
-            Part("epbl.bin", 0, 0x13000, "st2", "tee", header=True),
-            Part("bl2.bin", 0x13000, 0x8B000, "st2", "ree"),
-            Part("pad.bin", 0x8B000, 0xE9000),
-            Part("dpm.img", 0xE9000, 0xEB000, "st2", "tee"),
-            Part("pad2.bin", 0xEB000, 0xED000),
-            Part("lk.bin", 0xED000, 0x4ED000, "st2", "ree"),
-            Part("el3_mon.bin", 0x4ED000, 0x54D000, "st2", "tee"),
-            Part("tail.bin", 0x54D000, None),
-        ),
-    ),
-    Image("tzar.img"),
-    Image(
-        "tzsw.img",
-        avb="tzsw",
-        parts=(
-            Part("tzsw.bin", 0, 0x100000, "st2", "tee"),
-            Part("tail.bin", 0x100000, None),
-        ),
-    ),
-    Image("uh.bin"),
-    Image(
-        "up_param.bin",
-        stage=None, key=None,
-    ),
-    Image(
-        "vbmeta.img",
-        stage=None, key=None,
-    ),
+def load_part(item):
+    return Part(
+        item["name"], number(item["start"]), number(item["end"]),
+        item.get("stage"), item.get("key"), item.get("header", False),
+        item.get("avb_keys", False),
+    )
+
+
+def load_image(item):
+    return Image(
+        item["name"], item.get("stage", "st2"), item.get("key", "ree"),
+        item.get("avb"), tuple(load_part(part) for part in item.get("parts", ())),
+        item.get("bundle", True), item.get("version", True),
+    )
+
+
+CONFIG = json.loads(
+    (Path(__file__).resolve().parents[1] / "s5e8825.json").read_text()
 )
 
-BY_NAME = {img.name: img for img in IMAGES}
+IMAGES = tuple(load_image(item) for item in CONFIG["images"])
+BY_NAME = {image.name: image for image in IMAGES}
+SIGNING_TYPE = int(CONFIG["signing_type"])
+KEY_IMAGE = CONFIG["key_image"]
+VBMETA_IMAGE = CONFIG["vbmeta_image"]
+LK_IMAGE = CONFIG["lk"]["image"]
+LK_PART = CONFIG["lk"]["part"]

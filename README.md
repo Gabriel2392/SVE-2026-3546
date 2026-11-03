@@ -1,0 +1,53 @@
+# SVE-2026-3546 - Unsigned code loading for S-LK
+
+This PoC uses it to fuse Secure Boot KEY2 and flash re-signed bootloader files on s5e8825 platform (no others for now, i'm lazy).
+
+## Demo
+
+![Demo](AUTH-preview.gif)
+
+## Requirements
+
+- Python 3
+- `clang`
+- `aarch64-linux-gnu` binutils
+- libusb access to the phone
+
+Install the Python packages:
+
+```sh
+python3 -m pip install -r requirements.txt
+```
+
+## 1. Sign BL and PIT
+
+```sh
+./sign_bl.py BL.tar.md5 device.pit
+```
+
+Outputs:
+
+```text
+BL_RESIGNED.tar.md5
+device_RESIGNED.pit
+```
+
+## 2. Build the loader
+
+```sh
+./build_loader.sh BL_RESIGNED.tar.md5 device_RESIGNED.pit
+```
+
+Outputs:
+
+```text
+loader.bin
+loader.elf
+loader/bundle.bin
+```
+
+## 3. Run
+
+```sh
+./flash_and_fuse.py
+```

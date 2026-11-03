@@ -139,12 +139,13 @@ class Keys:
         raise ValueError(f"invalid ST2 key mode: {mode}")
 
 
-def sign_st1(buf: bytearray, keys: Keys, rb: int | None = None) -> None:
+def sign_st1(buf: bytearray, keys: Keys, rb: int | None = None,
+             image_type: int = 4) -> None:
     size = _u32(buf, 0) * 512
     if size != len(buf) or size < ST1_FOOTER:
         raise ValueError("invalid ST1 image size")
     foot = size - ST1_FOOTER
-    if _u32(buf, foot + 8) != 5 or _u32(buf, foot + 28) != 4:
+    if _u32(buf, foot + 8) != 5 or _u32(buf, foot + 28) != image_type:
         raise ValueError("ST1 is not CodeSigner v5")
     if rb is not None:
         _p32(buf, foot + 24, rb)
@@ -160,15 +161,16 @@ def sign_st1(buf: bytearray, keys: Keys, rb: int | None = None) -> None:
     at = foot + 1848
     buf[at:at + 136] = _sig(keys.st1, hashlib.sha512(buf[:at]).digest())
     buf[4:8] = hashlib.sha512(buf[16:]).digest()[:4]
-    verify_st1(buf, keys)
+    verify_st1(buf, keys, image_type)
 
 
-def verify_st1(buf: bytes | bytearray, keys: Keys | None = None) -> dict:
+def verify_st1(buf: bytes | bytearray, keys: Keys | None = None,
+               image_type: int = 4) -> dict:
     size = _u32(buf, 0) * 512
     if size != len(buf) or size < ST1_FOOTER:
         raise ValueError("invalid ST1 image size")
     foot = size - ST1_FOOTER
-    if _u32(buf, foot + 8) != 5 or _u32(buf, foot + 28) != 4:
+    if _u32(buf, foot + 8) != 5 or _u32(buf, foot + 28) != image_type:
         raise ValueError("invalid ST1 CodeSigner mode")
     tee = bytes(buf[foot + 100:foot + 624])
     ree = bytes(buf[foot + 624:foot + 1148])
@@ -188,18 +190,18 @@ def verify_st1(buf: bytes | bytearray, keys: Keys | None = None) -> dict:
 
 
 def sign_st2(buf: bytearray, keys: Keys, mode: str, header: bool = False,
-             rb: int | None = None) -> None:
+             rb: int | None = None, image_type: int = 4) -> None:
     end = boundary(buf)
     if end < ST2_FOOTER:
         raise ValueError("ST2 image is too small")
     foot = end - ST2_FOOTER
     key = keys.key(mode)
     kind = 0 if mode == "tee" else 1
-    if _u32(buf, foot + 4) != 4 or _u32(buf, foot + 8) not in (0, 1):
+    if _u32(buf, foot + 4) != image_type or _u32(buf, foot + 8) not in (0, 1):
         raise ValueError(f"invalid ST2 footer at {foot:#x}")
     if rb is not None:
         _p32(buf, foot, rb)
-    _p32(buf, foot + 4, 4)
+    _p32(buf, foot + 4, image_type)
     _p32(buf, foot + 8, kind)
     _p32(buf, foot + 12, zlib.crc32(pub_blob(key)))
     if header:
@@ -208,15 +210,16 @@ def sign_st2(buf: bytearray, keys: Keys, mode: str, header: bool = False,
     buf[at:at + 136] = _sig(key, hashlib.sha512(buf[:at]).digest())
     if header:
         buf[4:8] = hashlib.sha512(buf[16:]).digest()[:4]
-    verify_st2(buf, key.public_key(), mode, header)
+    verify_st2(buf, key.public_key(), mode, header, image_type)
 
 
 def verify_st2(buf: bytes | bytearray, key: ec.EllipticCurvePublicKey,
-               mode: str, header: bool = False) -> dict:
+               mode: str, header: bool = False, image_type: int = 4) -> dict:
     end = boundary(buf)
     foot = end - ST2_FOOTER
     kind = 0 if mode == "tee" else 1
-    if end < ST2_FOOTER or _u32(buf, foot + 4) != 4 or _u32(buf, foot + 8) != kind:
+    if (end < ST2_FOOTER or _u32(buf, foot + 4) != image_type or
+            _u32(buf, foot + 8) != kind):
         raise ValueError("ST2 mode mismatch")
     at = end - ST2_SKIP
     if header:
@@ -238,10 +241,11 @@ def verify_st2(buf: bytes | bytearray, key: ec.EllipticCurvePublicKey,
     }
 
 
-def stock_keys(fld: bytes) -> tuple[ec.EllipticCurvePublicKey, ec.EllipticCurvePublicKey]:
+def stock_keys(fld: bytes, image_type: int = 4) -> tuple[ec.EllipticCurvePublicKey, ec.EllipticCurvePublicKey]:
     size = _u32(fld, 0) * 512
     foot = size - ST1_FOOTER
-    if size > len(fld) or _u32(fld, foot + 8) != 5:
+    if (size > len(fld) or _u32(fld, foot + 8) != 5 or
+            _u32(fld, foot + 28) != image_type):
         raise ValueError("invalid stock FLD")
     return pub_key(fld[foot + 100:foot + 624]), pub_key(fld[foot + 624:foot + 1148])
 

@@ -1,0 +1,3 @@
+cryptography>=45
+lz4>=4
+pyusb
