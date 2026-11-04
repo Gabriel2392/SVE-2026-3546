@@ -57,3 +57,7 @@ loader/bundle.bin
 ```sh
 ./flash_and_fuse.py
 ```
+
+## Disclaimer
+
+This repo is for research purposes. No one else than you is responsible for what you do to your phone, especially if you're modifying it with LLMs.
