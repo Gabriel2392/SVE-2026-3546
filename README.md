@@ -32,7 +32,13 @@ BL_RESIGNED.tar.md5
 device_RESIGNED.pit
 ```
 
-## 2. Build the loader
+## 2. Find offsets. Only for s5e8825. For other platforms you're on your own.
+
+```sh
+./resolve.py BL_RESIGNED.tar.md5
+```
+
+## 3. Build the loader
 
 ```sh
 ./build_loader.sh BL_RESIGNED.tar.md5 device_RESIGNED.pit
@@ -46,7 +52,7 @@ loader.elf
 loader/bundle.bin
 ```
 
-## 3. Run
+## 4. Run
 
 ```sh
 ./flash_and_fuse.py

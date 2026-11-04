@@ -1,0 +1,10 @@
+/WORKDIR/
+/__pycache__/
+/signer/__pycache__/
+/link.ld
+/loader_profile.h
+/offsets.py
+/loader.bin
+/loader.elf
+/loader/bundle.bin
+/loader/bundle_expected.h
