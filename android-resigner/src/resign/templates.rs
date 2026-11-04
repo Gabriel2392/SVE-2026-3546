@@ -47,6 +47,7 @@ impl Catalog {
         let members = members.into_iter().collect::<Vec<_>>();
         let mut metadata = Vec::<(u8, String, usize, Template)>::new();
         let mut vbmeta = None;
+        let mut leaves = BTreeMap::new();
         let mut standalone = BTreeSet::new();
         for (name, data) in &members {
             if let Ok(parsed) = avb::parse(blob::bytes(data.clone())) {
@@ -54,6 +55,11 @@ impl Catalog {
                     if vbmeta.is_some() { bail!("BL archive contains multiple standalone AVB images") }
                     standalone.insert(name.clone());
                     vbmeta = Some(data.clone());
+                } else {
+                    for descriptor in parsed.descriptors.iter().filter(|descriptor| matches!(descriptor.tag(), 1 | 2)) {
+                        let part = descriptor.name()?.context("BL AVB descriptor has no partition name")?;
+                        if leaves.insert(part.clone(), descriptor.clone()).is_some() { bail!("duplicate BL AVB descriptor {part}") }
+                    }
                 }
             }
             for at in data.windows(MARKER.len()).enumerate().filter_map(|(at, value)| (value == MARKER).then_some(at)) {
@@ -70,6 +76,18 @@ impl Catalog {
             }
         }
         if metadata.is_empty() { bail!("BL archive has no valid SignerVer03 metadata") }
+        let vbmeta_data = vbmeta.as_ref().context("BL archive has no standalone vbmeta.img")?;
+        let parsed = avb::parse(blob::bytes(vbmeta_data.clone()))?;
+        let mut matched = BTreeSet::new();
+        for descriptor in parsed.descriptors.iter().filter(|descriptor| matches!(descriptor.tag(), 1 | 2)) {
+            let part = descriptor.name()?.context("BL vbmeta descriptor has no partition name")?;
+            if let Some(leaf) = leaves.get(&part) {
+                if descriptor != leaf { bail!("BL vbmeta descriptor does not match {part}") }
+                matched.insert(part);
+            }
+        }
+        let missing = leaves.keys().filter(|part| !matched.contains(*part)).collect::<Vec<_>>();
+        if !missing.is_empty() { bail!("BL vbmeta is missing descriptors: {missing:?}") }
         let versions = metadata.iter().map(|(_, _, _, template)| template.firmware_version()).collect::<Result<BTreeSet<_>>>()?;
         if versions.len() != 1 { bail!("BL images contain inconsistent firmware versions: {versions:?}") }
         let rollbacks = metadata.iter().map(|(_, _, _, template)| template.rollback()).collect::<Result<BTreeSet<_>>>()?;

@@ -90,7 +90,8 @@ fn derive_stock(cfg_raw: &[u8], cfg: &Config, src: &StockInput, bl: &Path,
     if fw != cat.version() || rb != cat.normal(cfg.android.st2_key_type)?.rollback()? { bail!("BL and AP firmware do not match") }
     let mut stock = Stock::new(&cfg.soc, &fw, rb, sha256_bytes(cfg_raw), hashes)?;
     for (name, rule) in &cfg.android.image_rules {
-        let mut rec = independent::record_from_stock(name, src.image(name)?, rule, None)?;
+        let source = if name == main { cat.vbmeta().context("BL archive has no vbmeta.img")? } else { src.image(name)? };
+        let mut rec = independent::record_from_stock(name, source, rule, None)?;
         let key = match rule.key {
             config::KeyPolicy::Auto => cfg.android.st2_key_type,
             config::KeyPolicy::Tee => 0,
@@ -207,7 +208,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     cfg.validate_image_rules()?;
     let names = cfg.android.archive.iter().chain(&cfg.android.vbmeta).cloned().collect::<Vec<_>>();
     let mut base = StockInput::single(&o.base, names)?;
-    let stock = if let Some(stock) = Stock::from_archive(&o.base)? {
+    let mut stock = if let Some(stock) = Stock::from_archive(&o.base)? {
         stock
     } else {
         let bl = o.bl.as_deref().context("archive has no android-resigner.json; pass --bl once")?;
@@ -221,6 +222,11 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         if cat.version() != stock.firmware() || cat.normal(cfg.android.st2_key_type)?.rollback()? != stock.rollback() {
             bail!("BL and AP firmware do not match")
         }
+        let main = cfg.android.vbmeta.last().context("vbmeta.img is not configured")?;
+        let rule = cfg.android.image_rules.get(main).context("vbmeta.img has no image rule")?;
+        let source = cat.vbmeta().context("BL archive has no vbmeta.img")?;
+        let record = independent::record_from_stock(main, source, rule, None)?;
+        stock.replace_image(main, record)?;
     }
     let keys = Keys::load(&root, &cfg.signing)?;
     let physical = inputs(o.images, &cfg.android.image_rules)?;

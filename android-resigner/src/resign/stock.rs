@@ -297,6 +297,16 @@ impl Stock {
         Ok(())
     }
 
+    pub(super) fn replace_image(&mut self, name: &str, record: ImageRecord) -> Result<()> {
+        let old = self.data.images.remove(name).with_context(|| format!("stock data has no image named {name}"))?;
+        self.data.images.insert(name.to_owned(), record);
+        if let Err(error) = self.validate(false) {
+            self.data.images.insert(name.to_owned(), old);
+            return Err(error)
+        }
+        Ok(())
+    }
+
     pub(super) fn require_config(&self, config: &[u8]) -> Result<()> {
         if digest(config) != self.data.config_sha256 { bail!("stock was created for a different config") }
         Ok(())
