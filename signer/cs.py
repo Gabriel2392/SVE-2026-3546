@@ -90,8 +90,15 @@ def avb_key_size(buf: bytes) -> int | None:
     size = 8 + bits // 4
     if len(buf) < size:
         return None
-    n = int.from_bytes(buf[8:8 + bits // 8], "big")
+    width = bits // 8
+    n = int.from_bytes(buf[8:8 + width], "big")
     if n.bit_length() != bits or not n & 1:
+        return None
+    low = n & 0xffffffff
+    if int.from_bytes(buf[4:8], "big") != (-pow(low, -1, 1 << 32)) & 0xffffffff:
+        return None
+    expected_rr = pow(2, bits * 2, n).to_bytes(width, "big")
+    if buf[8 + width:8 + width * 2] != expected_rr:
         return None
     return size
 

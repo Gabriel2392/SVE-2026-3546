@@ -1,6 +1,7 @@
 /WORKDIR/
 /__pycache__/
 /signer/__pycache__/
+/android-resigner/target/
 /link.ld
 /loader_profile.h
 /offsets.py

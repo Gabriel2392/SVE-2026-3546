@@ -19,6 +19,14 @@ Install the Python packages:
 python3 -m pip install -r requirements.txt
 ```
 
+Build the Android resigner:
+
+```sh
+cargo build --release --manifest-path android-resigner/Cargo.toml
+```
+
+Android signer commands: [android-resigner/README.md](android-resigner/README.md).
+
 ## 1. Sign BL and PIT
 
 ```sh
