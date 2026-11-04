@@ -1,4 +1,5 @@
 mod archive;
+mod aosp;
 mod android;
 mod avb;
 mod blob;
@@ -29,7 +30,7 @@ use archive::TarMd5;
 use config::Config;
 use crypto::Keys;
 use input::StockInput;
-use stock::{CodeSignerRecord, Stock, SourceHashes, sha256_bytes};
+use stock::{CodeSignerRecord, ImageRecord, Stock, SourceHashes, sha256_bytes};
 use templates::Catalog;
 
 #[derive(Debug)]
@@ -39,6 +40,7 @@ pub struct RunOptions {
     pub csc: PathBuf,
     pub bl: Option<PathBuf>,
     pub bl_output: Option<PathBuf>,
+    pub aosp_zip: Option<PathBuf>,
     pub images: BTreeMap<String, PathBuf>,
     pub logical: BTreeMap<String, PathBuf>,
     pub super_image: Option<PathBuf>,
@@ -71,6 +73,7 @@ pub struct UpdateApOptions {
     pub base: PathBuf,
     pub bl: Option<PathBuf>,
     pub bl_output: Option<PathBuf>,
+    pub aosp_zip: Option<PathBuf>,
     pub images: BTreeMap<String, PathBuf>,
     pub logical: BTreeMap<String, PathBuf>,
     pub incremental: bool,
@@ -203,6 +206,11 @@ fn inputs(paths: BTreeMap<String, PathBuf>, rules: &BTreeMap<String, config::Ima
 
 pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     let root = project_root(o.root.as_deref())?;
+    if let Some(path) = &o.aosp_zip {
+        if !path.is_file() { bail!("AOSP ZIP does not exist or is not a file: {}", path.display()) }
+        if path.canonicalize().ok() == o.output.canonicalize().ok() { bail!("AOSP ZIP cannot be the output") }
+        if o.bl.is_none() { bail!("update-ap --aosp-zip requires --bl") }
+    }
     let raw = fs::read(root.join("s5e8825.json"))?;
     let cfg = Config::load_path(&root.join("s5e8825.json"))?;
     cfg.validate_image_rules()?;
@@ -228,9 +236,41 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         let record = independent::record_from_stock(main, source, rule, None)?;
         stock.replace_image(main, record)?;
     }
+    let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
+    if aosp.as_ref().is_some_and(|aosp| aosp.metadata("pre-device") != Some("a53x")) { bail!("AOSP ZIP is not for a53x") }
+    if let Some(aosp) = &aosp { aosp.validate_firmware(stock.firmware())?; }
     let keys = Keys::load(&root, &cfg.signing)?;
-    let physical = inputs(o.images, &cfg.android.image_rules)?;
-    let logical = inputs(o.logical, &cfg.android.logical_rules)?;
+    let mut physical = inputs(o.images, &cfg.android.image_rules)?;
+    if let Some(aosp) = &aosp {
+        for name in ["boot.img", "vendor_boot.img", "dtbo.img", "recovery.img", "modem.bin"] {
+            if !physical.contains_key(name) {
+                if let Some(image) = aosp.physical(name, stock.firmware())? { physical.insert(name.into(), image); }
+            }
+        }
+    }
+    let mut logical = inputs(o.logical, &cfg.android.logical_rules)?;
+    if let Some(aosp) = &aosp {
+        let active = aosp.layout().partitions.keys().map(|name| format!("{name}.img")).collect::<BTreeSet<_>>();
+        let invalid = logical.keys().filter(|name| !active.contains(*name)).cloned().collect::<Vec<_>>();
+        if !invalid.is_empty() { bail!("logical replacements are absent from the AOSP layout: {invalid:?}") }
+        stock.retain_logical(&active)?;
+        for (part, layout) in &aosp.layout().partitions {
+            let name = format!("{part}.img");
+            let rule = cfg.android.logical_rules.get(&name).with_context(|| format!("no signing rule for AOSP logical partition {name}"))?;
+            let capacity = avb::minimum_capacity(avb::IntegrityKind::Hashtree, layout.size, &cfg.android.avb_generation.avb())?;
+            stock.set_logical(&name, ImageRecord::new(&rule.partition, capacity, None, None))?;
+            if !logical.contains_key(&name) {
+                let image = aosp.logical(&name)?.with_context(|| format!("AOSP ZIP has no image for {name}"))?;
+                logical.insert(name, image.image);
+            }
+        }
+        if let Some(vendor_boot) = physical.get("vendor_boot.img") {
+            let fstab = boot::logical_fstab(vendor_boot.clone())?;
+            let parts = aosp.layout().partitions.keys().cloned().collect::<BTreeSet<_>>();
+            let absent = fstab.difference(&parts).cloned().collect::<Vec<_>>();
+            if !absent.is_empty() { bail!("AOSP vendor_boot fstab references absent logical partitions: {absent:?}") }
+        }
+    }
     if physical.is_empty() && logical.is_empty() { bail!("update-ap requires at least one replacement") }
     let super_name = &cfg.android.super_image;
     if !logical.is_empty() && physical.contains_key(super_name) { bail!("super and logical replacements cannot be combined") }
@@ -249,9 +289,12 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         signed_physical.insert(name, built.image);
     }
     let mut signed_logical = BTreeMap::new();
+    let mut signed_leaves = BTreeMap::new();
     for (name, image) in logical {
         let rule = &cfg.android.logical_rules[&name];
         let built = independent::sign(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)?;
+        let descriptor = built.descriptor.context("signed logical image has no AVB descriptor")?;
+        signed_leaves.insert(name.clone(), vbmeta_build::Image { image: built.image.clone(), descriptor: Some(descriptor) });
         signed_logical.insert(name, built.image);
     }
     if let Some(image) = signed_physical.get(super_name) { base.replace(super_name, image.clone())? }
@@ -259,13 +302,36 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     let mut sources = android::logical_sources(&base, &cfg)?;
     let mut leaves = BTreeMap::new();
     if !signed_logical.is_empty() {
-        let updated = android::update_super(&cfg, &base, &stock, &keys, &signed_logical)?;
-        changed.insert(super_name.clone(), updated.image.clone());
-        sources.clear();
-        for (name, (image, descriptor)) in updated.logical {
-            let part = cfg.android.logical_rules[&name].partition.clone();
-            sources.insert(part, (image.clone(), image.len()?));
-            leaves.insert(name, vbmeta_build::Image { image, descriptor: Some(descriptor) });
+        if let Some(aosp) = &aosp {
+            let mut targets = Vec::new();
+            for part in aosp.layout().partitions.keys() {
+                let name = cfg.android.logical_rules.iter().find_map(|(name, rule)| (rule.partition == *part).then_some(name)).with_context(|| format!("no rule for AOSP partition {part}"))?;
+                let image = signed_logical.remove(name).with_context(|| format!("signed AOSP image is missing: {name}"))?;
+                targets.push((part.clone(), aosp.layout().partitions[part].group.clone(), image.len()?, image));
+            }
+            if !signed_logical.is_empty() { bail!("unexpected signed AOSP logical images: {:?}", signed_logical.keys().collect::<Vec<_>>()) }
+            let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, targets)?;
+            if super_image.metadata.device_size() != android::super_device_size(&base, &cfg)? { bail!("AOSP super device size differs from base super") }
+            let sparse = sparse::encode(super_image.raw, 4096)?;
+            let bl = o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?;
+            let seed = Catalog::open(bl)?.sparse_seed(cfg.android.st2_key_type, 4096)?;
+            let image = codesigner::sign_sparse(sparse, &seed, super_name, &keys)?;
+            changed.insert(super_name.clone(), image);
+            sources.clear();
+            for (name, value) in signed_leaves {
+                let part = cfg.android.logical_rules[&name].partition.clone();
+                sources.insert(part, (value.image.clone(), value.image.len()?));
+                leaves.insert(name, value);
+            }
+        } else {
+            let updated = android::update_super(&cfg, &base, &stock, &keys, &signed_logical)?;
+            changed.insert(super_name.clone(), updated.image.clone());
+            sources.clear();
+            for (name, (image, descriptor)) in updated.logical {
+                let part = cfg.android.logical_rules[&name].partition.clone();
+                sources.insert(part, (image.clone(), image.len()?));
+                leaves.insert(name, vbmeta_build::Image { image, descriptor: Some(descriptor) });
+            }
         }
     }
     let mut inputs = BTreeMap::new();
@@ -419,6 +485,9 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     let config = Config::load_path(&cfg_path)?;
     let bl = options.bl.as_ref().context("--bl BL_RESIGNED is required")?;
     if !bl.is_file() { bail!("BL archive does not exist or is not a file: {}", bl.display()) }
+    if let Some(path) = &options.aosp_zip {
+        if !path.is_file() { bail!("AOSP ZIP does not exist or is not a file: {}", path.display()) }
+    }
     let output = if options.output.is_dir() { options.output.join("AP_RESIGNED.tar.md5") } else { options.output.clone() };
     let parent = output_parent(&output);
     fs::create_dir_all(parent).with_context(|| format!("creating output directory {}", parent.display()))?;
@@ -427,6 +496,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
         for input in [&options.ap, &options.cp, &options.csc]
             .into_iter()
             .chain(options.bl.iter())
+            .chain(options.aosp_zip.iter())
             .chain(options.images.values())
             .chain(options.logical.values())
             .chain(options.super_image.iter())
@@ -442,16 +512,14 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     eprintln!("Mapping firmware");
     let mut input = StockInput::open(&options.ap, &options.cp, &options.csc, requested)?;
     let keys = Keys::load(&root, &config.signing)?;
-    let stock = if let Some(bl) = options.bl.as_deref() {
-        let hashes = SourceHashes::from_paths(bl, &options.ap, &options.cp, &options.csc)?;
-        Some(derive_stock(&cfg_raw, &config, &input, bl, hashes, true)?)
-    } else {
-        None
-    };
-    if let Some(stock) = &stock {
-        stock.require_config(&cfg_raw)?;
-        if stock.soc() != config.soc { bail!("saved signing data uses a different SoC") }
-    }
+    let hashes = SourceHashes::from_paths(bl, &options.ap, &options.cp, &options.csc)?;
+    let mut stock = derive_stock(&cfg_raw, &config, &input, bl, hashes, true)?;
+    stock.require_config(&cfg_raw)?;
+    if stock.soc() != config.soc { bail!("saved signing data uses a different SoC") }
+    let aosp = options.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
+    if aosp.as_ref().is_some_and(|aosp| aosp.metadata("pre-device") != Some("a53x")) { bail!("AOSP ZIP is not for a53x") }
+    if let Some(aosp) = &aosp { aosp.validate_firmware(stock.firmware())?; }
+    if aosp.is_some() && options.super_image.is_some() { bail!("--super cannot be combined with --aosp-zip") }
     let mut paths = options.images;
     if let Some(path) = options.super_image {
         if paths.keys().any(|name| image_name(&config.android.image_rules, name).ok().as_deref() == Some(&config.android.super_image)) {
@@ -459,27 +527,72 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
         }
         paths.insert(config.android.super_image.clone(), path);
     }
-    let physical = inputs(paths, &config.android.image_rules)?;
-    let logical = inputs(options.logical, &config.android.logical_rules)?;
+    let mut physical = inputs(paths, &config.android.image_rules)?;
+    if let Some(aosp) = &aosp {
+        for name in ["boot.img", "vendor_boot.img", "dtbo.img", "recovery.img", "modem.bin"] {
+            if !physical.contains_key(name) {
+                if let Some(image) = aosp.physical(name, stock.firmware())? { physical.insert(name.into(), image); }
+            }
+        }
+    }
+    let mut logical = inputs(options.logical, &config.android.logical_rules)?;
+    if let Some(aosp) = &aosp {
+        let active = aosp.layout().partitions.keys().map(|name| format!("{name}.img")).collect::<BTreeSet<_>>();
+        let invalid = logical.keys().filter(|name| !active.contains(*name)).cloned().collect::<Vec<_>>();
+        if !invalid.is_empty() { bail!("logical replacements are absent from the AOSP layout: {invalid:?}") }
+        stock.retain_logical(&active)?;
+        for (part, layout) in &aosp.layout().partitions {
+            let name = format!("{part}.img");
+            let rule = config.android.logical_rules.get(&name).with_context(|| format!("no signing rule for AOSP logical partition {name}"))?;
+            let capacity = avb::minimum_capacity(avb::IntegrityKind::Hashtree, layout.size, &config.android.avb_generation.avb())?;
+            stock.set_logical(&name, ImageRecord::new(&rule.partition, capacity, None, None))?;
+            if !logical.contains_key(&name) {
+                let image = aosp.logical(&name)?.with_context(|| format!("AOSP ZIP has no image for {name}"))?;
+                if image.size != layout.size { bail!("AOSP logical size mismatch for {name}") }
+                logical.insert(name, image.image);
+            }
+        }
+        if let Some(vendor_boot) = physical.get("vendor_boot.img") {
+            let fstab = boot::logical_fstab(vendor_boot.clone())?;
+            let parts = aosp.layout().partitions.keys().cloned().collect::<BTreeSet<_>>();
+            let absent = fstab.difference(&parts).cloned().collect::<Vec<_>>();
+            if !absent.is_empty() { bail!("AOSP vendor_boot fstab references absent logical partitions: {absent:?}") }
+        }
+    }
     if !logical.is_empty() && physical.contains_key(&config.android.super_image) { bail!("super and logical replacements cannot be combined") }
     eprintln!("Signing images");
-    if let Some(stock) = &stock {
-        for (name, source) in physical {
-            let rule = &config.android.image_rules[&name];
-            if rule.codesigner == config::CodeSignerKind::StandaloneVbmeta { bail!("standalone vbmeta is regenerated: {name}") }
-            let built = independent::wrap(&name, source, stock, rule, &keys, &config.android.avb_generation)?;
-            if built.partition != rule.partition || matches!(rule.avb, config::AvbKind::Hash | config::AvbKind::Hashtree) && built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
-            input.replace(&name, built.image)?;
+    for (name, source) in physical {
+        let rule = &config.android.image_rules[&name];
+        if rule.codesigner == config::CodeSignerKind::StandaloneVbmeta { bail!("standalone vbmeta is regenerated: {name}") }
+        let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation)?;
+        if built.partition != rule.partition || matches!(rule.avb, config::AvbKind::Hash | config::AvbKind::Hashtree) && built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
+        input.replace(&name, built.image)?;
+    }
+    if !logical.is_empty() {
+        let mut signed = BTreeMap::new();
+        for (name, source) in logical {
+            let rule = &config.android.logical_rules[&name];
+            let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation)?;
+            if built.partition != rule.partition || built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
+            signed.insert(name, built.image);
         }
-        if !logical.is_empty() {
-            let mut signed = BTreeMap::new();
-            for (name, source) in logical {
-                let rule = &config.android.logical_rules[&name];
-                let built = independent::wrap(&name, source, stock, rule, &keys, &config.android.avb_generation)?;
-                if built.partition != rule.partition || built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
-                signed.insert(name, built.image);
+        if let Some(aosp) = &aosp {
+            let mut targets = Vec::new();
+            for part in aosp.layout().partitions.keys() {
+                let name = config.android.logical_rules.iter().find_map(|(name, rule)| (rule.partition == *part).then_some(name)).with_context(|| format!("no rule for AOSP partition {part}"))?;
+                let image = signed.remove(name).with_context(|| format!("signed AOSP image is missing: {name}"))?;
+                let size = image.len()?;
+                targets.push((part.clone(), aosp.layout().partitions[part].group.clone(), size, image));
             }
-            let updated = android::update_super(&config, &input, stock, &keys, &signed)?;
+            if !signed.is_empty() { bail!("unexpected signed AOSP logical images: {:?}", signed.keys().collect::<Vec<_>>()) }
+            let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, targets)?;
+            if super_image.metadata.device_size() != android::super_device_size(&input, &config)? { bail!("AOSP super device size differs from stock super") }
+            let sparse = sparse::encode(super_image.raw, 4096)?;
+            let seed = Catalog::open(bl)?.sparse_seed(config.android.st2_key_type, 4096)?;
+            let image = codesigner::sign_sparse(sparse, &seed, &config.android.super_image, &keys)?;
+            input.replace(&config.android.super_image, image)?;
+        } else {
+            let updated = android::update_super(&config, &input, &stock, &keys, &signed)?;
             input.replace(&config.android.super_image, updated.image)?;
         }
     }
@@ -494,8 +607,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     eprintln!("Packing {output_name}");
     let tar_name = output_name.strip_suffix(".md5").unwrap_or(output_name);
     let mut tar = TarMd5::create(&partial.path, tar_name)?;
-    let data = stock.as_ref().map(Stock::encode).transpose()?
-        .map(|data| (stock::MEMBER.to_owned(), blob::bytes(data)));
+    let data = Some((stock::MEMBER.to_owned(), blob::bytes(stock.encode()?)));
     let names = config.android.archive.iter().chain(&config.android.vbmeta).cloned().collect::<Vec<_>>();
     input.pack(&mut tar, &mut built.images, &names, data)?;
     tar.finish()?;

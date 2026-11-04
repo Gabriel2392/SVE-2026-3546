@@ -39,6 +39,20 @@ AP_RESIGNED.tar.md5
 BL_RESIGNED.tar.md5 (vbmeta.img updated)
 ```
 
+```sh
+android-resigner AP.tar.md5 CP.tar.md5 CSC.tar.md5 \
+  --bl BL_RESIGNED.tar.md5 \
+  --aosp-zip lineage.zip \
+  -o AP_RESIGNED.tar.md5
+```
+
+Result:
+
+```text
+AP_RESIGNED.tar.md5
+BL_RESIGNED.tar.md5 (vbmeta.img updated)
+```
+
 ## Update AP
 
 ```sh
@@ -61,6 +75,21 @@ android-resigner update-ap \
   --base AP_RESIGNED.tar.md5 \
   --bl BL_RESIGNED.tar.md5 \
   --image boot=boot.img \
+  --incremental
+```
+
+Result:
+
+```text
+INCREMENTAL.tar.md5
+BL_RESIGNED.tar.md5 (vbmeta.img updated)
+```
+
+```sh
+android-resigner update-ap \
+  --base AP_RESIGNED.tar.md5 \
+  --bl BL_RESIGNED.tar.md5 \
+  --aosp-zip lineage.zip \
   --incremental
 ```
 

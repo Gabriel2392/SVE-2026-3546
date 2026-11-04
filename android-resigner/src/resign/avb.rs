@@ -203,6 +203,33 @@ pub(super) struct GenerationPolicy {
     pub release: String,
 }
 
+pub(super) fn minimum_capacity(kind: IntegrityKind, payload: u64, policy: &GenerationPolicy) -> Result<u64> {
+    if payload == 0 || policy.data_block < 512 || policy.data_block != policy.hash_block || !policy.data_block.is_power_of_two() || policy.fec_roots >= 255 {
+        bail!("invalid generated AVB capacity policy")
+    }
+    let block = policy.data_block as u64;
+    let aligned = round(payload, block)?;
+    let integrity = match kind {
+        IntegrityKind::Hash => 0,
+        IntegrityKind::Hashtree => {
+            let mut value = aligned;
+            let mut tree = 0u64;
+            while value > block {
+                let level = round(value.div_ceil(block).checked_mul(32).context("AVB tree size overflow")?, block)?;
+                tree = tree.checked_add(level).context("AVB tree size overflow")?;
+                value = level;
+            }
+            let fec = if policy.fec_roots == 0 { 0 } else {
+                let covered = aligned.checked_add(tree).context("AVB FEC size overflow")?;
+                let rsn = 255u64 - policy.fec_roots as u64;
+                covered.div_ceil(block).div_ceil(rsn).checked_mul(policy.fec_roots as u64).and_then(|value| value.checked_mul(block)).context("AVB FEC size overflow")?
+            };
+            tree.checked_add(fec).context("AVB integrity size overflow")?
+        }
+    };
+    round(aligned.checked_add(integrity).and_then(|value| value.checked_add(BLOCK * 2)).context("AVB capacity overflow")?, BLOCK)
+}
+
 fn descriptor_block(tag: u64, fixed: usize, variable: &[u8]) -> Vec<u8> {
     let total = (fixed + variable.len()).next_multiple_of(8);
     let mut out = vec![0; total];
@@ -465,23 +492,31 @@ pub fn add_footer(payload: Blob, template: &Parsed, keys: &Keys) -> Result<(Blob
     match descriptor.tag() { 1 => add_hashtree_footer(payload, template, keys), 2 => add_hash_footer(payload, template, keys), tag => bail!("unsupported AVB integrity descriptor {tag}") }
 }
 
-pub fn standalone(template: &Parsed, replacements: &BTreeMap<String, Descriptor>, targets: &std::collections::BTreeSet<String>, keys: &Keys) -> Result<Vec<u8>> {
+pub fn standalone(template: &Parsed, replacements: &BTreeMap<String, Descriptor>, targets: &std::collections::BTreeSet<String>,
+                  managed: &std::collections::BTreeSet<String>, keys: &Keys) -> Result<Vec<u8>> {
     if template.footer.is_some() { bail!("standalone vbmeta unexpectedly has an AVB footer") }
-    let mut list = Vec::with_capacity(template.descriptors.len());
+    let mut list = Vec::with_capacity(template.descriptors.len() + replacements.len());
+    let mut seen = std::collections::BTreeSet::new();
     for mut descriptor in template.descriptors.clone() {
         if matches!(descriptor.tag(), 1 | 2) {
             let name = descriptor.name()?.context("vbmeta integrity descriptor has no partition name")?;
+            if managed.contains(&name) && !targets.contains(&name) { continue }
             if let Some(replacement) = replacements.get(&name) {
                 if replacement.tag() != descriptor.tag() { bail!("AVB descriptor type changed for {name}") }
                 descriptor = replacement.clone();
             } else if targets.contains(&name) {
                 bail!("no freshly signed descriptor for configured Android partition {name}")
             }
+            if targets.contains(&name) { seen.insert(name); }
         } else if descriptor.tag() == 4 {
             let name = descriptor.name()?.context("AVB chain descriptor has no partition name")?;
-            if targets.contains(&name) { descriptor.replace_chain_key(&keys.avb_public)?; }
+            if managed.contains(&name) && !targets.contains(&name) { continue }
+            if targets.contains(&name) { descriptor.replace_chain_key(&keys.avb_public)?; seen.insert(name); }
         }
         list.push(descriptor);
+    }
+    for (name, descriptor) in replacements {
+        if targets.contains(name) && !seen.contains(name) { list.push(descriptor.clone()); }
     }
     generate(&list, &template.header, keys, template.header.required_minor)
 }

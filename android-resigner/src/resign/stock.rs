@@ -307,6 +307,23 @@ impl Stock {
         Ok(())
     }
 
+    pub(super) fn set_logical(&mut self, name: &str, record: ImageRecord) -> Result<()> {
+        if self.data.images.contains_key(name) { bail!("image and logical record share the name {name}") }
+        let old = self.data.logical.insert(name.to_owned(), record);
+        if let Err(error) = self.validate(false) {
+            match old { Some(old) => { self.data.logical.insert(name.to_owned(), old); }, None => { self.data.logical.remove(name); } }
+            return Err(error)
+        }
+        Ok(())
+    }
+
+    pub(super) fn retain_logical(&mut self, names: &BTreeSet<String>) -> Result<()> {
+        let old = self.data.logical.clone();
+        self.data.logical.retain(|name, _| names.contains(name));
+        if let Err(error) = self.validate(false) { self.data.logical = old; return Err(error) }
+        Ok(())
+    }
+
     pub(super) fn require_config(&self, config: &[u8]) -> Result<()> {
         if digest(config) != self.data.config_sha256 { bail!("stock was created for a different config") }
         Ok(())

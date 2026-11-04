@@ -125,3 +125,31 @@ pub fn repack(source: Blob, rules: &Ramdisk, keys: &Keys, description: &str) -> 
     let mut out = if data.starts_with(b"ANDROID!") { normal(&data, rules, keys, description)? } else if data.starts_with(b"VNDRBOOT") { vendor(&data, rules, keys, description)? } else { bail!("unsupported boot image magic") };
     if marker { out.extend_from_slice(MARKER) } Ok(blob::bytes(out))
 }
+
+pub(super) fn logical_fstab(source: Blob) -> Result<BTreeSet<String>> {
+    let mut data = blob::read_all(source.as_ref(), 512 << 20)?;
+    if data.ends_with(MARKER) { data.truncate(data.len() - MARKER.len()) }
+    if data.len() < 2128 || &data[..8] != b"VNDRBOOT" || u32le(&data, 8)? != 4 { bail!("only Android vendor_boot v4 is supported") }
+    let page = u32le(&data, 12)? as usize;
+    let header_size = u32le(&data, 2096)? as usize;
+    let ramdisk_size = u32le(&data, 24)? as usize;
+    let dtb_size = u32le(&data, 2100)? as usize;
+    let table_size = u32le(&data, 2112)? as usize;
+    let entries = u32le(&data, 2116)? as usize;
+    let entry_size = u32le(&data, 2120)? as usize;
+    if page < 512 || !page.is_power_of_two() || !(2128..=page * 16).contains(&header_size) || entry_size < 108
+        || table_size != entries.checked_mul(entry_size).context("vendor ramdisk table overflow")? { bail!("invalid vendor_boot geometry") }
+    let ramdisk_at = align(header_size, page)?;
+    let dtb_at = align(add(ramdisk_at, ramdisk_size)?, page)?;
+    let table_at = align(add(dtb_at, dtb_size)?, page)?;
+    let table = component(&data, table_at, table_size, "vendor ramdisk table")?;
+    let mut output = BTreeSet::new();
+    for index in 0..entries {
+        let entry = &table[index * entry_size..(index + 1) * entry_size];
+        let size = u32le(entry, 0)? as usize;
+        let offset = u32le(entry, 4)? as usize;
+        let fragment = component(&data, add(ramdisk_at, offset)?, size, "vendor ramdisk fragment")?;
+        output.extend(ramdisk::logical_fstab(fragment)?);
+    }
+    Ok(output)
+}

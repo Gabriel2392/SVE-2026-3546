@@ -13,6 +13,7 @@ struct FullArgs {
     csc: PathBuf,
     bl: Option<PathBuf>,
     bl_output: Option<PathBuf>,
+    aosp_zip: Option<PathBuf>,
     images: BTreeMap<String, PathBuf>,
     logical: BTreeMap<String, PathBuf>,
     super_image: Option<PathBuf>,
@@ -45,6 +46,7 @@ struct UpdateApArgs {
     base: PathBuf,
     bl: Option<PathBuf>,
     bl_output: Option<PathBuf>,
+    aosp_zip: Option<PathBuf>,
     images: BTreeMap<String, PathBuf>,
     logical: BTreeMap<String, PathBuf>,
     incremental: bool,
@@ -65,7 +67,7 @@ enum Command {
 fn usage(program: &OsString) -> String {
     let program = PathBuf::from(program);
     format!(
-        "usage:\n  {0} AP CP CSC --bl BL_RESIGNED [options]\n  {0} update-ap --base AP_RESIGNED.tar.md5 [--bl BL_RESIGNED] [--image NAME=PATH]... [--logical NAME=PATH]... [--incremental] [-o OUTPUT]\n  {0} sign-image --from AP_RESIGNED.tar.md5 --name NAME INPUT OUTPUT\n  {0} build-vbmeta --from AP_RESIGNED.tar.md5 --image NAME=PATH... -o DIR\n\noptions: [--bl-output OUT] [--image NAME=PATH]... [--logical NAME=PATH]... [--super PATH] [-o AP_RESIGNED.tar.md5] [--root DIR] [--force]",
+        "usage:\n  {0} AP CP CSC --bl BL_RESIGNED [options]\n  {0} update-ap --base AP_RESIGNED.tar.md5 [--bl BL_RESIGNED] [--image NAME=PATH]... [--logical NAME=PATH]... [--incremental] [-o OUTPUT]\n  {0} sign-image --from AP_RESIGNED.tar.md5 --name NAME INPUT OUTPUT\n  {0} build-vbmeta --from AP_RESIGNED.tar.md5 --image NAME=PATH... -o DIR\n\noptions: [--aosp-zip PATH] [--bl-output OUT] [--image NAME=PATH]... [--logical NAME=PATH]... [--super PATH] [-o AP_RESIGNED.tar.md5] [--root DIR] [--force]",
         program.display()
     )
 }
@@ -96,6 +98,7 @@ fn parse_full(program: &OsString, values: &[OsString]) -> Result<FullArgs> {
     let mut root = None;
     let mut bl = None;
     let mut bl_output = None;
+    let mut aosp_zip = None;
     let mut images = BTreeMap::new();
     let mut logical = BTreeMap::new();
     let mut super_image = None;
@@ -129,6 +132,12 @@ fn parse_full(program: &OsString, values: &[OsString]) -> Result<FullArgs> {
                 Some("--bl-output") => {
                     let argument = value(values, &mut at, "--bl-output", program)?;
                     set_path(&mut bl_output, argument, "--bl-output")?;
+                    at += 1;
+                    continue
+                }
+                Some("--aosp-zip") => {
+                    let argument = value(values, &mut at, "--aosp-zip", program)?;
+                    set_path(&mut aosp_zip, argument, "--aosp-zip")?;
                     at += 1;
                     continue
                 }
@@ -168,6 +177,7 @@ fn parse_full(program: &OsString, values: &[OsString]) -> Result<FullArgs> {
         csc: positional.remove(0),
         bl,
         bl_output,
+        aosp_zip,
         images,
         logical,
         super_image,
@@ -276,6 +286,7 @@ fn parse_update_ap(program: &OsString, values: &[OsString]) -> Result<UpdateApAr
     let mut base = None;
     let mut bl = None;
     let mut bl_output = None;
+    let mut aosp_zip = None;
     let mut output = None;
     let mut root = None;
     let mut images = BTreeMap::new();
@@ -297,6 +308,10 @@ fn parse_update_ap(program: &OsString, values: &[OsString]) -> Result<UpdateApAr
             "--bl-output" => {
                 let argument = value(values, &mut at, "--bl-output", program)?;
                 set_path(&mut bl_output, argument, "--bl-output")?;
+            }
+            "--aosp-zip" => {
+                let argument = value(values, &mut at, "--aosp-zip", program)?;
+                set_path(&mut aosp_zip, argument, "--aosp-zip")?;
             }
             "-o" | "--output" => {
                 let argument = value(values, &mut at, &item, program)?;
@@ -329,6 +344,7 @@ fn parse_update_ap(program: &OsString, values: &[OsString]) -> Result<UpdateApAr
         base,
         bl,
         bl_output,
+        aosp_zip,
         images,
         logical,
         incremental,
@@ -361,6 +377,7 @@ fn full_options(args: FullArgs) -> RunOptions {
         csc: args.csc,
         bl: args.bl,
         bl_output: args.bl_output,
+        aosp_zip: args.aosp_zip,
         images: args.images,
         logical: args.logical,
         super_image: args.super_image,
@@ -391,6 +408,7 @@ fn run() -> Result<()> {
             base: args.base,
             bl: args.bl,
             bl_output: args.bl_output,
+            aosp_zip: args.aosp_zip,
             images: args.images,
             logical: args.logical,
             incremental: args.incremental,

@@ -1,7 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, io, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest as Sha2Digest, Sha256};
+
+use crate::io::{Bytes, ReadAt};
 
 const RESERVED: u64 = 4096;
 const GEOMETRY_SIZE: u64 = 4096;
@@ -21,6 +23,14 @@ fn u32le(data: &[u8], at: usize) -> Result<u32> {
 
 fn u64le(data: &[u8], at: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(data.get(at..at + 8).context("short LP field")?.try_into().unwrap()))
+}
+
+fn set32(data: &mut [u8], at: usize, value: u32) -> Result<()> {
+    data.get_mut(at..at + 4).context("short LP field")?.copy_from_slice(&value.to_le_bytes()); Ok(())
+}
+
+fn set64(data: &mut [u8], at: usize, value: u64) -> Result<()> {
+    data.get_mut(at..at + 8).context("short LP field")?.copy_from_slice(&value.to_le_bytes()); Ok(())
 }
 
 fn name(data: &[u8]) -> Result<String> {
@@ -80,7 +90,7 @@ struct Partition { name: String, first: u32, count: u32 }
 struct Extent { sectors: u64, kind: u32, data: u64, source: u32 }
 
 #[derive(Clone, Copy, Debug)]
-struct Device { first: u64, size: u64 }
+struct Device { first: u64, size: u64, alignment: u32, offset: u32 }
 
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -125,7 +135,7 @@ fn parse_copy(data: &[u8], at: usize, max: usize) -> Result<Metadata> {
     for index in 0..device_table.count as usize {
         let at = device_table.offset as usize + index * device_table.size as usize;
         let entry = &tables[at..at + device_table.size as usize];
-        devices.push(Device { first: u64le(entry, 0)?, size: u64le(entry, 16)? });
+        devices.push(Device { first: u64le(entry, 0)?, alignment: u32le(entry, 8)?, offset: u32le(entry, 12)?, size: u64le(entry, 16)? });
     }
     if devices.is_empty() { bail!("LP metadata has no block device") }
     Ok(Metadata { partitions, extents, devices })
@@ -195,4 +205,146 @@ impl Metadata {
         }
         Ok(Plan { output_name, size: logical, segments })
     }
+}
+
+struct RawSuper {
+    len: u64,
+    pieces: Vec<(u64, Arc<dyn ReadAt>)>,
+}
+
+impl ReadAt for RawSuper {
+    fn len(&self) -> io::Result<u64> { Ok(self.len) }
+
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
+        if offset >= self.len || output.is_empty() { return Ok(0) }
+        let count = output.len().min(usize::try_from(self.len - offset).unwrap_or(usize::MAX));
+        output[..count].fill(0);
+        let end = offset + count as u64;
+        for (start, source) in &self.pieces {
+            let source_len = source.len()?;
+            let source_end = start.checked_add(source_len).ok_or(io::ErrorKind::InvalidInput)?;
+            let left = offset.max(*start);
+            let right = end.min(source_end);
+            if left >= right { continue }
+            let out_at = (left - offset) as usize;
+            source.read_exact_at(left - start, &mut output[out_at..out_at + (right - left) as usize])?;
+        }
+        Ok(count)
+    }
+}
+
+pub struct BuiltSuper {
+    pub prefix: Vec<u8>,
+    pub metadata: Metadata,
+    pub raw: Arc<dyn ReadAt>,
+}
+
+fn aligned(value: u64, alignment: u32, offset: u32) -> Result<u64> {
+    if alignment == 0 { return Ok(value) }
+    let alignment = alignment as u64;
+    let offset = offset as u64;
+    if !alignment.is_power_of_two() || offset >= alignment { bail!("invalid LP block-device alignment") }
+    let delta = (offset + alignment - value % alignment) % alignment;
+    value.checked_add(delta).context("LP extent alignment overflow")
+}
+
+pub fn build_super(empty: &[u8], expected_groups: &BTreeMap<String, u64>, targets: Vec<(String, String, u64, Arc<dyn ReadAt>)>) -> Result<BuiltSuper> {
+    if empty.len() < GEOMETRY_SIZE as usize + 128 { bail!("compact LP metadata is too short") }
+    let geometry = geometry_at(empty, 0)?;
+    let header_at = GEOMETRY_SIZE as usize;
+    let fixed = empty.get(header_at..header_at + 128).context("short compact LP header")?;
+    if u32le(fixed, 0)? != HEADER_MAGIC || u16le(fixed, 4)? != 10 { bail!("invalid compact LP metadata header") }
+    let header_size = u32le(fixed, 8)? as usize;
+    let tables_size = u32le(fixed, 44)? as usize;
+    let header = empty.get(header_at..header_at + header_size).context("short compact LP header")?;
+    let tables = empty.get(header_at + header_size..header_at + header_size + tables_size).context("short compact LP tables")?;
+    let mut checked = header.to_vec(); checked[12..44].fill(0);
+    if Sha256::digest(checked).as_slice() != &header[12..44] || Sha256::digest(tables).as_slice() != &header[48..80] {
+        bail!("compact LP metadata checksum mismatch")
+    }
+    let part_table = table(header, 80, tables_size as u32, 52)?;
+    let extent_table = table(header, 92, tables_size as u32, 24)?;
+    let group_table = table(header, 104, tables_size as u32, 48)?;
+    let device_table = table(header, 116, tables_size as u32, 64)?;
+    if extent_table.count != 0 || device_table.count != 1 { bail!("unsupported compact LP layout") }
+    let mut template_parts = BTreeMap::new();
+    for index in 0..part_table.count as usize {
+        let at = part_table.offset as usize + index * part_table.size as usize;
+        let entry = tables.get(at..at + part_table.size as usize).context("short compact LP partition")?;
+        let part_name = name(&entry[..36])?;
+        if template_parts.insert(part_name.clone(), (entry.to_vec(), u32le(entry, 48)?)).is_some() { bail!("duplicate compact LP partition {part_name}") }
+    }
+    let mut groups = Vec::with_capacity(group_table.count as usize);
+    for index in 0..group_table.count as usize {
+        let at = group_table.offset as usize + index * group_table.size as usize;
+        let entry = tables.get(at..at + group_table.size as usize).context("short compact LP group")?.to_vec();
+        groups.push((name(&entry[..36])?, u64le(&entry, 40)?, entry));
+    }
+    let device_at = device_table.offset as usize;
+    let device_raw = tables.get(device_at..device_at + device_table.size as usize).context("short compact LP block device")?.to_vec();
+    let device = Device { first: u64le(&device_raw, 0)?, alignment: u32le(&device_raw, 8)?, offset: u32le(&device_raw, 12)?, size: u64le(&device_raw, 16)? };
+    let prefix_size = RESERVED.checked_add((GEOMETRY_SIZE + geometry.max as u64 * geometry.slots as u64).checked_mul(2).context("LP metadata size overflow")?).context("LP metadata size overflow")?;
+    if device.size > 16 << 30 || device.first.checked_mul(SECTOR).is_none_or(|first| first < prefix_size || first >= device.size) { bail!("invalid compact LP block device") }
+    for (name, maximum) in expected_groups {
+        let found = groups.iter().find(|(group, _, _)| group == name).with_context(|| format!("compact LP metadata has no group {name}"))?;
+        if found.1 != *maximum { bail!("LP group {name} maximum does not match dynamic layout") }
+    }
+    for (name, maximum, _) in &groups {
+        if *maximum != 0 && !expected_groups.contains_key(name) { bail!("unexpected LP group {name}") }
+    }
+    let wanted = targets.iter().map(|(name, _, _, _)| name.clone()).collect::<BTreeSet<_>>();
+    if wanted.len() != targets.len() || wanted != template_parts.keys().cloned().collect() { bail!("logical targets do not match compact LP partitions") }
+    let mut group_usage = vec![0u64; groups.len()];
+    let mut part_data = Vec::with_capacity(targets.len() * part_table.size as usize);
+    let mut extent_data = Vec::with_capacity(targets.len() * 24);
+    let mut pieces = Vec::with_capacity(targets.len() + 1);
+    let mut physical = device.first.checked_mul(SECTOR).context("LP first sector overflow")?;
+    for (index, (part_name, expected_group, size, image)) in targets.into_iter().enumerate() {
+        if size == 0 || size % SECTOR != 0 || image.len()? != size { bail!("invalid logical image size for {part_name}") }
+        let (mut part, group) = template_parts.remove(&part_name).unwrap();
+        let group_at = usize::try_from(group).context("LP group index overflow")?;
+        if groups.get(group_at).map(|group| group.0.as_str()) != Some(expected_group.as_str()) { bail!("LP partition {part_name} is in the wrong group") }
+        let usage = group_usage.get_mut(group_at).context("LP partition has invalid group")?;
+        *usage = usage.checked_add(size).context("LP group size overflow")?;
+        set32(&mut part, 40, index as u32)?; set32(&mut part, 44, 1)?;
+        part_data.extend_from_slice(&part);
+        physical = aligned(physical, device.alignment, device.offset)?;
+        let end = physical.checked_add(size).context("LP image allocation overflow")?;
+        if end > device.size { bail!("logical images exceed super device") }
+        let mut extent = vec![0; 24]; set64(&mut extent, 0, size / SECTOR)?; set32(&mut extent, 8, 0)?;
+        set64(&mut extent, 12, physical / SECTOR)?; set32(&mut extent, 20, 0)?;
+        extent_data.extend_from_slice(&extent); pieces.push((physical, image)); physical = end;
+    }
+    for (index, (group_name, maximum, _)) in groups.iter().enumerate() {
+        if *maximum != 0 && group_usage[index] > *maximum { bail!("LP group {group_name} exceeds its maximum size") }
+    }
+    let group_data = groups.into_iter().flat_map(|(_, _, raw)| raw).collect::<Vec<_>>();
+    let mut encoded_tables = Vec::with_capacity(part_data.len() + extent_data.len() + group_data.len() + device_raw.len());
+    encoded_tables.extend_from_slice(&part_data); let extent_offset = encoded_tables.len(); encoded_tables.extend_from_slice(&extent_data);
+    let group_offset = encoded_tables.len(); encoded_tables.extend_from_slice(&group_data); let device_offset = encoded_tables.len(); encoded_tables.extend_from_slice(&device_raw);
+    let mut encoded_header = header.to_vec();
+    set32(&mut encoded_header, 44, encoded_tables.len() as u32)?;
+    set32(&mut encoded_header, 80, 0)?; set32(&mut encoded_header, 84, part_data.len() as u32 / part_table.size)?; set32(&mut encoded_header, 88, part_table.size)?;
+    set32(&mut encoded_header, 92, extent_offset as u32)?; set32(&mut encoded_header, 96, extent_data.len() as u32 / 24)?; set32(&mut encoded_header, 100, 24)?;
+    set32(&mut encoded_header, 104, group_offset as u32)?; set32(&mut encoded_header, 108, group_data.len() as u32 / group_table.size)?; set32(&mut encoded_header, 112, group_table.size)?;
+    set32(&mut encoded_header, 116, device_offset as u32)?; set32(&mut encoded_header, 120, 1)?; set32(&mut encoded_header, 124, device_table.size)?;
+    encoded_header[12..44].fill(0); encoded_header[48..80].copy_from_slice(Sha256::digest(&encoded_tables).as_slice());
+    let header_hash = Sha256::digest(&encoded_header); encoded_header[12..44].copy_from_slice(header_hash.as_slice());
+    let metadata_len = encoded_header.len().checked_add(encoded_tables.len()).context("LP metadata size overflow")?;
+    if metadata_len > geometry.max as usize { bail!("LP metadata exceeds geometry maximum") }
+    let mut slot = vec![0; geometry.max as usize]; slot[..encoded_header.len()].copy_from_slice(&encoded_header);
+    slot[encoded_header.len()..metadata_len].copy_from_slice(&encoded_tables);
+    let mut prefix = vec![0; prefix_size as usize];
+    prefix[RESERVED as usize..(RESERVED + GEOMETRY_SIZE) as usize].copy_from_slice(&empty[..GEOMETRY_SIZE as usize]);
+    prefix[(RESERVED + GEOMETRY_SIZE) as usize..(RESERVED + 2 * GEOMETRY_SIZE) as usize].copy_from_slice(&empty[..GEOMETRY_SIZE as usize]);
+    let primary = (RESERVED + 2 * GEOMETRY_SIZE) as usize;
+    let span = geometry.max as usize * geometry.slots as usize;
+    for index in 0..geometry.slots as usize {
+        let at = primary + index * geometry.max as usize; prefix[at..at + slot.len()].copy_from_slice(&slot);
+        let at = primary + span + index * geometry.max as usize; prefix[at..at + slot.len()].copy_from_slice(&slot);
+    }
+    let metadata = parse(&prefix)?;
+    pieces.insert(0, (0, Arc::new(Bytes(prefix.clone()))));
+    let raw: Arc<dyn ReadAt> = Arc::new(RawSuper { len: device.size, pieces });
+    Ok(BuiltSuper { prefix, metadata, raw })
 }

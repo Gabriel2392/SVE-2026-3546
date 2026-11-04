@@ -12,7 +12,7 @@ use super::{
 };
 
 impl AvbGenerationPolicy {
-    fn avb(&self) -> GenerationPolicy {
+    pub(super) fn avb(&self) -> GenerationPolicy {
         GenerationPolicy {
             data_block: self.data_block, hash_block: self.hash_block, fec_roots: self.fec_roots,
             flags: self.flags, rollback_index: self.rollback_index, rollback_location: self.rollback_location,
@@ -112,10 +112,7 @@ fn existing_avb(source: &Blob, kind: AvbKind) -> Result<Option<Parsed>> {
     }
 }
 
-fn input_avb(source: &Blob) -> Result<Option<Parsed>> {
-    let len = source.len()?;
-    if avb::payload_boundary(source, len)?.is_some() { Ok(Some(avb::parse(source.clone())?)) } else { Ok(None) }
-}
+fn input_avb(source: &Blob) -> Result<Option<u64>> { avb::payload_boundary(source, source.len()?) }
 
 fn integrity_kind(rule: &ImageRule) -> Result<IntegrityKind> {
     match rule.avb {
@@ -151,12 +148,8 @@ fn avb_template(stock: &Stock, record: &ImageRecord, rule: &ImageRule,
     avb::generated_template(integrity_kind(rule)?, &rule.partition, record.capacity(), payload_size, &salt, &policy.avb())
 }
 
-fn avb_payload(source: Blob, parsed: &Option<Parsed>) -> Result<Blob> {
-    if let Some(parsed) = parsed {
-        let footer = parsed.footer.as_ref().context("AVB image has no footer")?;
-        return Ok(blob::region(source, 0, footer.original_size)?)
-    }
-    Ok(source)
+fn avb_payload(source: Blob, boundary: Option<u64>) -> Result<Blob> {
+    boundary.map_or(Ok(source.clone()), |size| Ok(blob::region(source, 0, size)?))
 }
 
 fn resign_filesystem(mut payload: Blob, rule: &Filesystem, keys: &Keys, description: &str) -> Result<(Blob, usize)> {
@@ -207,8 +200,7 @@ fn add_avb(payload: Blob, stock: &Stock, record: &ImageRecord, rule: &ImageRule,
 fn sign_normal(name: &str, source: Blob, stock: &Stock, record: &ImageRecord,
                rule: &ImageRule, keys: &Keys, policy: &AvbGenerationPolicy, nested: bool) -> Result<SignedImage> {
     let mut metadata = BuildMetadata::default();
-    let parsed = input_avb(&source)?;
-    let boundary = parsed.as_ref().and_then(|item| item.footer.as_ref()).map_or(source.len()?, |footer| footer.original_size);
+    let boundary = input_avb(&source)?.unwrap_or(source.len()?);
     let present = codesigner::present(&source, boundary)?;
     if !present && !rule.synthesize_missing_wrappers { bail!("{name}: CodeSigner wrapper is missing and synthesis is disabled") }
     metadata.synthesized_codesigner = !present;
@@ -232,8 +224,8 @@ fn sign_normal(name: &str, source: Blob, stock: &Stock, record: &ImageRecord,
 fn sign_without_codesigner(name: &str, source: Blob, stock: &Stock, record: &ImageRecord,
                            rule: &ImageRule, keys: &Keys, policy: &AvbGenerationPolicy, nested: bool) -> Result<SignedImage> {
     let mut metadata = BuildMetadata::default();
-    let parsed = input_avb(&source)?;
-    let mut payload = avb_payload(source, &parsed)?;
+    let boundary = input_avb(&source)?;
+    let mut payload = avb_payload(source, boundary)?;
     if nested && let Some(filesystem) = &rule.filesystem {
         (payload, metadata.nested_firmware) = resign_filesystem(payload, filesystem, keys, name)?;
     }
@@ -247,8 +239,8 @@ fn sign_sparse(name: &str, source: Blob, stock: &Stock, record: &ImageRecord,
     let raw = sparse::decode_if_sparse(source)?;
     let seed = sparse_seed(&raw, rule, record, &mut metadata)?;
     metadata.code_key = Some(Template::from_sparse_seed(&seed)?.key_type()?);
-    let parsed = input_avb(&raw)?;
-    let mut payload = avb_payload(raw, &parsed)?;
+    let boundary = input_avb(&raw)?;
+    let mut payload = avb_payload(raw, boundary)?;
     let mut normalized = vec![0; 0x400];
     if !matches!(rule.avb, AvbKind::None) { normalized[0x300..0x400].copy_from_slice(&seed[0x300..0x400]); }
     payload = blob::patch(payload, vec![(0, normalized)])?;

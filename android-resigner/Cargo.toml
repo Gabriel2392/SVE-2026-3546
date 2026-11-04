@@ -22,6 +22,7 @@ strip = true
 
 [dependencies]
 anyhow = "1"
+brotli = "8"
 crc32fast = "1"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 hex = "0.4"

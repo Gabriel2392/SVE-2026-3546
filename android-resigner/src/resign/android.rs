@@ -60,6 +60,10 @@ pub(super) fn logical_sources(source: &dyn ImageSource, config: &Config) -> Resu
     }).collect()
 }
 
+pub(super) fn super_device_size(source: &dyn ImageSource, config: &Config) -> Result<u64> {
+    Ok(Input::open(source, config)?.metadata.device_size())
+}
+
 fn leaf(image: &Blob, rule: &ImageRule) -> Result<avb::Descriptor> {
     let tag = match rule.avb { AvbKind::Hash => 2, AvbKind::Hashtree => 1, _ => bail!("{} has no logical AVB rule", rule.partition) };
     let parsed = avb::parse(image.clone())?;
@@ -255,14 +259,18 @@ fn physical(source: &dyn ImageSource, name: &str, rule: &ImageRule, keys: &Keys,
     else { Ok((signed, None)) }
 }
 
-fn vbmeta(input: &dyn ImageSource, name: &str, replacements: &BTreeMap<String, avb::Descriptor>, targets: &BTreeSet<String>, keys: &Keys, catalog: Option<&Catalog>, main: bool, build_id: &str) -> Result<Blob> {
+fn vbmeta(input: &dyn ImageSource, name: &str, replacements: &BTreeMap<String, avb::Descriptor>, targets: &BTreeSet<String>,
+          managed: &BTreeSet<String>, keys: &Keys, catalog: Option<&Catalog>, main: bool, build_id: &str) -> Result<Blob> {
     let source = if main { catalog.and_then(Catalog::vbmeta).unwrap_or(input.image(name)?) } else { input.image(name)? };
     let size = source.len()?; let code = codesigner::extract(&source, size)?;
     let image_id = code.firmware_version()?;
     if !codesigner::same_build_family(build_id, &image_id) { bail!("{name} build ID mismatch: {image_id} is not in {build_id}") }
-    let available = size.checked_sub(codesigner::NORMAL as u64).context("standalone vbmeta is too small")?; let parsed = avb::parse(source)?;
-    let encoded = avb::standalone(&parsed, replacements, targets, keys)?;
-    if encoded.len() as u64 > available { bail!("rebuilt {name} does not fit its stock CodeSigner boundary") }
+    let parsed = avb::parse(source)?;
+    let encoded = avb::standalone(&parsed, replacements, targets, managed, keys)?;
+    let needed = (encoded.len() as u64).checked_add(codesigner::NORMAL as u64).context("vbmeta size overflow")?;
+    let output_size = if needed <= size { size } else { needed.next_multiple_of(4096) };
+    if output_size > 1 << 20 { bail!("rebuilt {name} is too large") }
+    let available = output_size.checked_sub(codesigner::NORMAL as u64).context("standalone vbmeta is too small")?;
     let payload = blob::Concat::blob([blob::bytes(encoded.clone()), blob::zeroes(available - encoded.len() as u64)])?;
     let image = codesigner::append(payload, &code, name, keys)?;
     eprintln!("CodeSigned {name} ({})", mode(code.key_type()?));
@@ -287,10 +295,16 @@ pub(super) fn build(config: &Config, input: &dyn ImageSource, keys: &Keys, bl: O
         if let Some(descriptor) = descriptor { let partition = descriptor.name()?.context("physical AVB descriptor has no partition name")?; if descriptors.insert(partition.clone(), descriptor).is_some() { bail!("duplicate signed descriptor {partition}") } }
         images.insert(name.clone(), image);
     }
-    let targets = descriptors.keys().cloned().chain(config.android.archive.iter().chain(&config.android.vbmeta).filter_map(|name| Path::new(name).file_stem()?.to_str().map(str::to_owned))).collect();
+    let managed = config.android.image_rules.values().chain(config.android.logical_rules.values()).map(|rule| rule.partition.clone()).collect::<BTreeSet<_>>();
     for name in &config.android.vbmeta {
         let main = name == main_vbmeta;
-        images.insert(name.clone(), vbmeta(input, name, &descriptors, &targets, keys, catalog.as_ref(), main, &build_id).with_context(|| format!("building {name}"))?);
+        let mut targets = BTreeSet::new();
+        for dep in config.android.dependencies.get(name).into_iter().flatten() {
+            let rule = config.android.image_rules.get(dep).or_else(|| config.android.logical_rules.get(dep)).with_context(|| format!("dependency {dep} has no rule"))?;
+            if descriptors.contains_key(&rule.partition) { targets.insert(rule.partition.clone()); }
+            else if !rule.optional && matches!(rule.avb, AvbKind::Hash | AvbKind::Hashtree) { bail!("missing descriptor for {dep}") }
+        }
+        images.insert(name.clone(), vbmeta(input, name, &descriptors, &targets, &managed, keys, catalog.as_ref(), main, &build_id).with_context(|| format!("building {name}"))?);
     }
     Ok(Built { images, descriptors })
 }

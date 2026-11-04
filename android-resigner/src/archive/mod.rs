@@ -1,6 +1,8 @@
 mod tar;
+mod zip;
 
 pub use tar::{IndexedTarEntry, TarIndex, TarMetadata};
+pub use zip::{Zip, ZipEntry};
 
 use std::{io, path::{Component, Path, PathBuf}};
 

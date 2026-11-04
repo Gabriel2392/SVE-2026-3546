@@ -96,20 +96,23 @@ fn build_one(name: &str, cfg: &Config, stock: &Stock, keys: &Keys,
         let rule = cfg.android.image_rules.get(&dep).or_else(|| cfg.android.logical_rules.get(&dep))
             .with_context(|| format!("dependency {dep} has no rule"))?;
         if rule.optional && !stock.has(&dep) && !descriptors.contains_key(&dep) { continue }
-        let kinds = tags.get(&rule.partition).with_context(|| format!("{name} has no descriptor for required image {dep}"))?;
         targets.insert(rule.partition.clone());
+        let kinds = tags.get(&rule.partition);
         if let Some(item) = descriptors.get(&dep) {
-            if kinds.contains(&item.tag()) { updates.insert(rule.partition.clone(), item.clone()); }
-            else if !kinds.contains(&4) { bail!("{name} descriptor type mismatch for dependency {dep}") }
-        } else if matches!(rule.avb, AvbKind::Hash | AvbKind::Hashtree) && !kinds.contains(&4) {
+            if kinds.is_none_or(|kinds| kinds.contains(&item.tag())) { updates.insert(rule.partition.clone(), item.clone()); }
+            else if !kinds.is_some_and(|kinds| kinds.contains(&4)) { bail!("{name} descriptor type mismatch for dependency {dep}") }
+        } else if matches!(rule.avb, AvbKind::Hash | AvbKind::Hashtree) && !kinds.is_some_and(|kinds| kinds.contains(&4)) {
             bail!("{name} has no fresh descriptor for dependency {dep}")
-        } else if rule.avb == AvbKind::Standalone && !kinds.contains(&4) {
+        } else if rule.avb == AvbKind::Standalone && !kinds.is_some_and(|kinds| kinds.contains(&4)) {
             bail!("{name} cannot update non-chain standalone dependency {dep}")
         }
     }
-    let raw = avb::standalone(&parsed, &updates, &targets, keys)?;
-    let cap = record.capacity().checked_sub(codesigner::NORMAL as u64).context("vbmeta stock capacity is too small")?;
-    if raw.len() as u64 > cap { bail!("rebuilt {name} exceeds stock capacity") }
+    let managed = cfg.android.image_rules.values().chain(cfg.android.logical_rules.values()).map(|rule| rule.partition.clone()).collect::<BTreeSet<_>>();
+    let raw = avb::standalone(&parsed, &updates, &targets, &managed, keys)?;
+    let needed = (raw.len() as u64).checked_add(codesigner::NORMAL as u64).context("vbmeta size overflow")?;
+    let output_size = if needed <= record.capacity() { record.capacity() } else { needed.next_multiple_of(4096) };
+    if output_size > 1 << 20 { bail!("rebuilt {name} is too large") }
+    let cap = output_size.checked_sub(codesigner::NORMAL as u64).context("vbmeta capacity is too small")?;
     let len = raw.len() as u64;
     let payload = blob::Concat::blob([blob::bytes(raw), blob::zeroes(cap - len)])?;
     codesigner::append(payload, &template(stock, name, rule)?, name, keys)

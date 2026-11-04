@@ -10,6 +10,14 @@ use super::{codesigner, config::Ramdisk, crypto::Keys};
 
 const LEGACY: &[u8] = b"\x02\x21\x4c\x18";
 const LEGACY_BLOCK: usize = 8 << 20;
+const MAX_RAMDISK: usize = 512 << 20;
+
+fn limited(mut reader: impl Read) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.by_ref().take(MAX_RAMDISK as u64 + 1).read_to_end(&mut output)?;
+    if output.len() > MAX_RAMDISK { bail!("ramdisk expands past {MAX_RAMDISK} bytes") }
+    Ok(output)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Compression {
@@ -24,7 +32,7 @@ enum Compression {
 fn decompress(data: &[u8]) -> Result<(Vec<u8>, Compression)> {
     let mut out = Vec::new();
     if data.starts_with(b"\x1f\x8b") {
-        flate2::read::MultiGzDecoder::new(data).read_to_end(&mut out)?;
+        out = limited(flate2::read::MultiGzDecoder::new(data))?;
         return Ok((out, Compression::Gzip));
     }
     if data.starts_with(LEGACY) {
@@ -44,25 +52,25 @@ fn decompress(data: &[u8]) -> Result<(Vec<u8>, Compression)> {
                 .get(at..at + size)
                 .context("truncated legacy LZ4 block")?;
             at += size;
-            out.extend(
-                block::decompress(encoded, Some(LEGACY_BLOCK as i32))
-                    .context("invalid legacy LZ4 block")?,
-            );
+            let decoded = block::decompress(encoded, Some(LEGACY_BLOCK as i32)).context("invalid legacy LZ4 block")?;
+            if out.len().checked_add(decoded.len()).is_none_or(|size| size > MAX_RAMDISK) { bail!("ramdisk expands past {MAX_RAMDISK} bytes") }
+            out.extend(decoded);
         }
         return Ok((out, Compression::Lz4Legacy));
     }
     if data.starts_with(b"\x04\x22\x4d\x18") {
-        lz4::Decoder::new(data)?.read_to_end(&mut out)?;
+        out = limited(lz4::Decoder::new(data)?)?;
         return Ok((out, Compression::Lz4Frame));
     }
     if data.starts_with(b"\x28\xb5\x2f\xfd") {
-        return Ok((zstd::stream::decode_all(data)?, Compression::Zstd));
+        return Ok((limited(zstd::stream::read::Decoder::new(data)?)?, Compression::Zstd));
     }
     if data.starts_with(b"\xfd7zXZ\0") {
-        xz2::read::XzDecoder::new(data).read_to_end(&mut out)?;
+        out = limited(xz2::read::XzDecoder::new(data))?;
         return Ok((out, Compression::Xz));
     }
     if matches!(data.get(..6), Some(b"070701" | b"070702")) {
+        if data.len() > MAX_RAMDISK { bail!("ramdisk exceeds {MAX_RAMDISK} bytes") }
         return Ok((data.to_vec(), Compression::None));
     }
     bail!("unsupported ramdisk compression")
@@ -216,6 +224,26 @@ fn entries(data: &[u8]) -> Result<Vec<Entry>> {
         bail!("ramdisk contains no structural newc archive")
     }
     Ok(out)
+}
+
+pub(super) fn logical_fstab(data: &[u8]) -> Result<BTreeSet<String>> {
+    let (archive, _) = decompress(data)?;
+    let mut output = BTreeSet::new();
+    for entry in entries(&archive)? {
+        let Some(name) = entry.name else { continue };
+        if !entry.regular || !name.rsplit('/').next().is_some_and(|name| name.starts_with("fstab")) { continue }
+        let text = std::str::from_utf8(&archive[entry.data]).with_context(|| format!("{name} is not UTF-8"))?;
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+            let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+            if fields.len() < 5 { bail!("invalid fstab line in {name}") }
+            if fields[4..].iter().flat_map(|field| field.split(',')).any(|flag| flag == "logical") {
+                let part = fields[0];
+                if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) { bail!("invalid logical partition in {name}") }
+                output.insert(part.to_owned());
+            }
+        }
+    }
+    Ok(output)
 }
 
 const NEWC_HEADER: usize = 110;
