@@ -490,7 +490,8 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     let mut tar = TarMd5::create(&partial.path, tar_name)?;
     let data = stock.as_ref().map(Stock::encode).transpose()?
         .map(|data| (stock::MEMBER.to_owned(), blob::bytes(data)));
-    input.pack(&mut tar, &mut built.images, data)?;
+    let names = config.android.archive.iter().chain(&config.android.vbmeta).cloned().collect::<Vec<_>>();
+    input.pack(&mut tar, &mut built.images, &names, data)?;
     tar.finish()?;
     fs::OpenOptions::new().read(true).open(&partial.path)?.sync_all()?;
     if let Some(bl) = options.bl {

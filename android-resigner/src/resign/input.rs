@@ -166,9 +166,9 @@ impl ReadAt for FrameBlob {
 }
 
 pub(super) struct StockInput {
-    archives: Vec<TarIndex>,
     images: BTreeMap<String, Blob>,
     transport: BTreeMap<String, Blob>,
+    metadata: BTreeMap<String, Meta>,
 }
 
 pub(super) trait ImageSource {
@@ -204,7 +204,7 @@ impl StockInput {
     }
 
     fn load(archives: Vec<TarIndex>, names: impl IntoIterator<Item = String>) -> Result<Self> {
-        let mut images = BTreeMap::new(); let mut transport = BTreeMap::new();
+        let mut images = BTreeMap::new(); let mut transport = BTreeMap::new(); let mut metadata = BTreeMap::new();
         for name in names {
             if name.is_empty() || name.contains(['/', '\\']) { bail!("unsafe configured image name {name:?}") }
             let packed = format!("{name}.lz4"); let mut found: Option<(&TarIndex, &IndexedTarEntry)> = None;
@@ -217,9 +217,11 @@ impl StockInput {
             let (index, entry) = found.with_context(|| format!("firmware archives are missing {packed}"))?;
             let frame = FrameBlob::open(index.region(entry)?)?;
             let raw = sparse::decode_if_sparse(frame.clone()).with_context(|| format!("decoding {packed}"))?;
+            let meta = index.metadata(entry)?;
+            metadata.insert(name.clone(), Meta { mode: meta.mode & 0o7777, mtime: meta.mtime });
             transport.insert(name.clone(), frame); images.insert(name, raw);
         }
-        Ok(Self { archives, images, transport })
+        Ok(Self { images, transport, metadata })
     }
 
     pub(super) fn image(&self, name: &str) -> Result<Blob> {
@@ -239,35 +241,13 @@ impl StockInput {
     pub(super) fn names(&self) -> impl Iterator<Item = &str> { self.images.keys().map(String::as_str) }
 
     pub(super) fn pack(&self, output: &mut TarMd5, images: &mut BTreeMap<String, Blob>,
-                       mut extra: Option<(String, Blob)>) -> Result<()> {
-        let mut written = BTreeSet::new();
-        let mut replaced = BTreeSet::new();
-        for archive in &self.archives {
-            for entry in archive.entries() {
-                if !written.insert(entry.name.clone()) { continue }
-                let source = archive.region(entry)?;
-                let meta = archive.metadata(entry)?;
-                let meta = Meta { mode: meta.mode & 0o7777, mtime: meta.mtime };
-                if extra.as_ref().is_some_and(|(name, _)| name == &entry.name) {
-                    let (_, data) = extra.take().unwrap();
-                    output.member(&entry.name, data, meta, b'0')?;
-                    continue
-                }
-                let file = entry.name.rsplit('/').next().unwrap_or(&entry.name);
-                let replacement = matches!(entry.kind, 0 | b'0')
-                    .then(|| file.strip_suffix(".lz4"))
-                    .flatten()
-                    .filter(|name| images.contains_key(*name));
-                if let Some(name) = replacement {
-                    if !replaced.insert(name.to_owned()) { bail!("image appears in more than one firmware archive: {name}") }
-                    let image = images.remove(name).context("replacement image disappeared")?;
-                    output.lz4(entry.name.trim_end_matches(".lz4"), image, meta)?;
-                } else {
-                    output.member(&entry.name, Arc::new(source), meta, entry.kind)?;
-                }
-            }
+                       names: &[String], extra: Option<(String, Blob)>) -> Result<()> {
+        for name in names {
+            let image = images.remove(name).with_context(|| format!("rebuilt image is missing: {name}"))?;
+            let meta = *self.metadata.get(name).with_context(|| format!("stock metadata is missing: {name}"))?;
+            output.lz4(name, image, meta)?;
         }
-        if !images.is_empty() { bail!("firmware archives are missing images: {:?}", images.keys().collect::<Vec<_>>()) }
+        if !images.is_empty() { bail!("unexpected rebuilt images: {:?}", images.keys().collect::<Vec<_>>()) }
         if let Some((name, data)) = extra {
             output.member(&name, data, Meta { mode: 0o644, mtime: 0 }, b'0')?;
         }
