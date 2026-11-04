@@ -397,7 +397,9 @@ def comp_output(data):
             continue
         if words[1] & 0xFFC003FF != 0xB9400108:
             continue
-        if words[2:6] != [0xF85F83B4, 0xAA1A03E1, 0xAA1803E2, 0x7100011F]:
+        if (words[2] != 0xF85F83B4 or words[3] != 0xAA1A03E1 or
+                (words[4] & 0xFFE0FFFF) != 0xAA0003E2 or
+                words[5] != 0x7100011F):
             continue
         base = mov_wide(words[6])
         if not base or base[1:] != (8, 0, 0x52800000):
