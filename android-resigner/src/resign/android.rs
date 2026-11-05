@@ -267,12 +267,7 @@ fn vbmeta(input: &dyn ImageSource, name: &str, replacements: &BTreeMap<String, a
     if !codesigner::same_build_family(build_id, &image_id) { bail!("{name} build ID mismatch: {image_id} is not in {build_id}") }
     let parsed = avb::parse(source)?;
     let encoded = avb::standalone(&parsed, replacements, targets, managed, keys)?;
-    let needed = (encoded.len() as u64).checked_add(codesigner::NORMAL as u64).context("vbmeta size overflow")?;
-    let output_size = if needed <= size { size } else { needed.next_multiple_of(4096) };
-    if output_size > 1 << 20 { bail!("rebuilt {name} is too large") }
-    let available = output_size.checked_sub(codesigner::NORMAL as u64).context("standalone vbmeta is too small")?;
-    let payload = blob::Concat::blob([blob::bytes(encoded.clone()), blob::zeroes(available - encoded.len() as u64)])?;
-    let image = codesigner::append(payload, &code, name, keys)?;
+    let image = codesigner::append_vbmeta(encoded, &code, name, keys)?;
     eprintln!("CodeSigned {name} ({})", mode(code.key_type()?));
     Ok(image)
 }

@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 
 use super::{
     avb::{self, Descriptor},
-    blob::{self, Blob},
+    blob::Blob,
     codesigner::{self, Template},
     config::{AvbKind, CodeSignerKind, Config, ImageRule, KeyPolicy},
     crypto::Keys,
@@ -109,13 +109,7 @@ fn build_one(name: &str, cfg: &Config, stock: &Stock, keys: &Keys,
     }
     let managed = cfg.android.image_rules.values().chain(cfg.android.logical_rules.values()).map(|rule| rule.partition.clone()).collect::<BTreeSet<_>>();
     let raw = avb::standalone(&parsed, &updates, &targets, &managed, keys)?;
-    let needed = (raw.len() as u64).checked_add(codesigner::NORMAL as u64).context("vbmeta size overflow")?;
-    let output_size = if needed <= record.capacity() { record.capacity() } else { needed.next_multiple_of(4096) };
-    if output_size > 1 << 20 { bail!("rebuilt {name} is too large") }
-    let cap = output_size.checked_sub(codesigner::NORMAL as u64).context("vbmeta capacity is too small")?;
-    let len = raw.len() as u64;
-    let payload = blob::Concat::blob([blob::bytes(raw), blob::zeroes(cap - len)])?;
-    codesigner::append(payload, &template(stock, name, rule)?, name, keys)
+    codesigner::append_vbmeta(raw, &template(stock, name, rule)?, name, keys)
 }
 
 pub(super) fn build(cfg: &Config, stock: &Stock, keys: &Keys,

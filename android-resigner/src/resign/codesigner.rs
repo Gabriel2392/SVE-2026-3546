@@ -149,6 +149,14 @@ pub fn append(payload: Blob, template: &Template, filename: &str, keys: &Keys) -
     ])?)
 }
 
+pub fn append_vbmeta(payload: Vec<u8>, template: &Template, filename: &str, keys: &Keys) -> Result<Blob> {
+    let size = (payload.len() as u64).checked_add(NORMAL as u64).context("vbmeta size overflow")?;
+    if size > 1 << 20 { bail!("rebuilt {filename} is too large") }
+    let image = append(blob::bytes(payload), template, filename, keys)?;
+    if image.len()? != size { bail!("rebuilt {filename} changed size after CodeSigner") }
+    Ok(image)
+}
+
 pub fn firmware_key_type(data: &[u8]) -> Option<u32> {
     if data.len() < FOOTER { return None }
     let footer = data.len() - FOOTER;
