@@ -159,12 +159,42 @@ pub fn append_vbmeta(payload: Vec<u8>, template: &Template, filename: &str, keys
     Ok(image)
 }
 
-pub fn add_signer_info(source: Blob, value: Vec<u8>) -> Result<Blob> {
+fn info_field(data: &[u8], start: usize, end: usize) -> Option<&[u8]> {
+    let field = data.get(start..end)?;
+    let len = field.iter().position(|&byte| byte == 0).unwrap_or(field.len());
+    (len != 0 && field[len..].iter().all(|&byte| byte == 0)).then_some(&field[..len])
+}
+
+fn build_id(data: &[u8], start: usize, len: usize, optional: bool) -> bool {
+    let Some(field) = data.get(start..start + 0x10) else { return false };
+    if optional && field.iter().all(|&byte| byte == 0) { return true }
+    info_field(data, start, start + 0x10).is_some_and(|value| {
+        value.len() == len && value.last() == Some(&b'R')
+            && value[..value.len() - 1].iter().all(u8::is_ascii_digit)
+    })
+}
+
+fn matching_info(data: &[u8], expected: &[u8]) -> bool {
+    let Some(id) = info_field(expected, 0x10, 0x20) else { return false };
+    matches!(data.get(..12), Some(b"SignerVer01\0" | b"SignerVer02\0" | b"SignerVer03\0"))
+        && data.get(0x0c..0x10) == expected.get(0x0c..0x10)
+        && build_id(data, 0x10, id.len(), false)
+        && info_field(data, 0x20, 0x30) == info_field(expected, 0x20, 0x30)
+        && data.get(0x30..0x40) == expected.get(0x30..0x40)
+        && info_field(data, 0x40, 0x50).is_some_and(|value| value.len() == 14 && value.iter().all(u8::is_ascii_digit))
+        && data.get(0x50..NAME) == expected.get(0x50..NAME)
+        && info_field(data, NAME, NAME + NAME_LEN) == info_field(expected, NAME, NAME + NAME_LEN)
+        && build_id(data, 0xac, id.len(), true)
+        && build_id(data, 0xbc, id.len(), true)
+        && data.get(0xcc..INFO) == expected.get(0xcc..INFO)
+}
+
+pub fn ensure_signer_info(source: Blob, value: Vec<u8>) -> Result<Blob> {
     if value.len() != INFO || !value.starts_with(MARKER) { bail!("invalid logical SignerVer03 metadata") }
     if source.len()? < 0x400 { bail!("logical image is too small for SignerVer03 metadata") }
     let mut old = vec![0; INFO];
     source.read_exact_at(0x300, &mut old)?;
-    if old.iter().any(|&byte| byte != 0) && old != value { bail!("logical image has data where SignerVer03 must be stored") }
+    if matching_info(&old, &value) { return Ok(source) }
     Ok(blob::patch(source, vec![(0x300, value)])?)
 }
 

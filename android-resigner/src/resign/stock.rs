@@ -274,6 +274,14 @@ impl Stock {
         self.data.images.get(name).or_else(|| self.data.logical.get(name))
             .with_context(|| format!("stock has no signing record {name}"))
     }
+    pub(super) fn signer_info(&self, source: &str, filename: &str) -> Result<Vec<u8>> {
+        let value = self.image(source)?.codesigner().context("stock data has no CodeSigner entry")?;
+        let template = match value.material()? {
+            CodeSignerMaterial::Normal(value) => value,
+            CodeSignerMaterial::Sparse(value) => Template::from_sparse_seed(&value)?,
+        };
+        template.signer_info(filename)
+    }
     pub(super) fn has(&self, name: &str) -> bool { self.data.images.contains_key(name) || self.data.logical.contains_key(name) }
     pub(super) fn generated_salt(&self, partition: &str) -> [u8; 32] {
         let mut hash = Sha256::new(); hash.update(b"android-resigner-avb-v1\0");

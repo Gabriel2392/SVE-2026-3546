@@ -135,7 +135,11 @@ pub fn sign_image(o: SignImageOptions) -> Result<PathBuf> {
     if p.soc() != cfg.soc { bail!("saved signing data uses a different SoC") }
     let rule = cfg.android.image_rules.get(&o.name).or_else(|| cfg.android.logical_rules.get(&o.name))
         .with_context(|| format!("no signing rule for {}", o.name))?;
-    let src = blob::file(&o.input)?;
+    let mut src = blob::file(&o.input)?;
+    if cfg.android.logical_rules.contains_key(&o.name) {
+        let main = cfg.android.vbmeta.last().context("vbmeta.img is not configured")?;
+        src = codesigner::ensure_signer_info(src, p.signer_info(main, &o.name)?)?;
+    }
     eprintln!("Signing {}", o.name);
     let built = independent::sign(&o.name, src, &p, rule, &Keys::load(&root, &cfg.signing)?, &cfg.android.avb_generation)?;
     let key = built.metadata.code_key;
@@ -293,11 +297,10 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     }
     let mut signed_logical = BTreeMap::new();
     let mut signed_leaves = BTreeMap::new();
+    let main_vbmeta = cfg.android.vbmeta.last().context("vbmeta.img is not configured")?;
     for (name, image) in logical {
         let rule = &cfg.android.logical_rules[&name];
-        let image = if let Some(catalog) = &aosp_catalog {
-            codesigner::add_signer_info(image, catalog.signer_info(cfg.android.st2_key_type, &name)?)?
-        } else { image };
+        let image = codesigner::ensure_signer_info(image, stock.signer_info(main_vbmeta, &name)?)?;
         let built = independent::sign(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)?;
         let descriptor = built.descriptor.context("signed logical image has no AVB descriptor")?;
         signed_leaves.insert(name.clone(), vbmeta_build::Image { image: built.image.clone(), descriptor: Some(descriptor) });
@@ -576,11 +579,10 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     }
     if !logical.is_empty() {
         let mut signed = BTreeMap::new();
+        let main_vbmeta = config.android.vbmeta.last().context("vbmeta.img is not configured")?;
         for (name, source) in logical {
             let rule = &config.android.logical_rules[&name];
-            let source = if let Some(catalog) = &aosp_catalog {
-                codesigner::add_signer_info(source, catalog.signer_info(config.android.st2_key_type, &name)?)?
-            } else { source };
+            let source = codesigner::ensure_signer_info(source, stock.signer_info(main_vbmeta, &name)?)?;
             let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation)?;
             if built.partition != rule.partition || built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
             signed.insert(name, built.image);

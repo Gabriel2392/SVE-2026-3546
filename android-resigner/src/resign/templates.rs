@@ -118,9 +118,5 @@ impl Catalog {
         self.normal(key_type)?.sparse_seed(block_size)
     }
 
-    pub(super) fn signer_info(&self, key_type: u32, filename: &str) -> Result<Vec<u8>> {
-        self.normal(key_type)?.signer_info(filename)
-    }
-
     pub(super) fn vbmeta(&self) -> Option<Blob> { self.vbmeta.clone().map(blob::bytes) }
 }
