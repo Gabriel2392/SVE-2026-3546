@@ -266,6 +266,9 @@ static int flash_all(u32 *line)
     }
 
     show(line, GREEN, "ALL HASH MATCH");
+    result = fuse_key2(line);
+    if (result)
+        return result;
     show(line, WHITE, "FLASH BEGIN");
     for (u32 index = 0; index != header->count; ++index) {
         const struct entry *item = entry(header, index);
@@ -294,8 +297,6 @@ __attribute__((used)) u32 start_impl(void *response, u32 response_size)
     *(volatile u64 *)SEND_CALLBACK = SEND_CALLBACK_DEFAULT;
     u32 line = screen_cursor();
     u32 result = flash_all(&line);
-    if (!result)
-        result = fuse_key2(&line);
     ((u32 *)response)[1] = result ? 0xE0000000U | result : RESULT_OK;
     cache(response, response_size);
     return send_response(response, response_size);
