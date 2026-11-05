@@ -68,6 +68,8 @@ impl Template {
 
     pub(super) fn trailer(&self) -> Vec<u8> { [&self.info[..], &self.footer[..]].concat() }
 
+    pub(super) fn signer_info(&self, filename: &str) -> Result<Vec<u8>> { info(&self.info, filename) }
+
     pub(super) fn with_key_type(&self, key_type: u32) -> Result<Self> {
         if key_type > 1 { bail!("invalid ST2 key type {key_type}") }
         let mut footer = self.footer.clone(); footer[8..12].copy_from_slice(&key_type.to_le_bytes());
@@ -155,6 +157,15 @@ pub fn append_vbmeta(payload: Vec<u8>, template: &Template, filename: &str, keys
     let image = append(blob::bytes(payload), template, filename, keys)?;
     if image.len()? != size { bail!("rebuilt {filename} changed size after CodeSigner") }
     Ok(image)
+}
+
+pub fn add_signer_info(source: Blob, value: Vec<u8>) -> Result<Blob> {
+    if value.len() != INFO || !value.starts_with(MARKER) { bail!("invalid logical SignerVer03 metadata") }
+    if source.len()? < 0x400 { bail!("logical image is too small for SignerVer03 metadata") }
+    let mut old = vec![0; INFO];
+    source.read_exact_at(0x300, &mut old)?;
+    if old.iter().any(|&byte| byte != 0) && old != value { bail!("logical image has data where SignerVer03 must be stored") }
+    Ok(blob::patch(source, vec![(0x300, value)])?)
 }
 
 pub fn firmware_key_type(data: &[u8]) -> Option<u32> {

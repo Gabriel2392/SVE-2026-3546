@@ -93,6 +93,7 @@ pub fn encode(source: Blob, block: u32) -> Result<Blob> {
     let total_blocks = size / block as u64;
     if total_blocks > u32::MAX as u64 { bail!("raw image has too many sparse blocks") }
     let max_raw = ((u32::MAX as u64 - 12) / block as u64) as u32;
+    let max_fill = (u32::MAX as u64 / block as u64) as u32;
     let mut chunks = Vec::<Chunk>::new();
     let mut buffer = vec![0; 4 << 20];
     let batch_blocks = (buffer.len() / block as usize).max(1);
@@ -104,7 +105,8 @@ pub fn encode(source: Blob, block: u32) -> Result<Blob> {
         source.read_exact_at(index * block as u64, &mut buffer[..bytes])?;
         for piece in buffer[..bytes].chunks_exact(block as usize) {
             let kind = classify(piece);
-            if let Some(last) = chunks.last_mut().filter(|last| last.kind == kind && (kind != Kind::Raw || last.blocks < max_raw)) {
+            let limit = if kind == Kind::Raw { max_raw } else { max_fill };
+            if let Some(last) = chunks.last_mut().filter(|last| last.kind == kind && last.blocks < limit) {
                 last.blocks += 1;
             } else { chunks.push(Chunk { kind, start: index * block as u64, blocks: 1 }) }
             index += 1;

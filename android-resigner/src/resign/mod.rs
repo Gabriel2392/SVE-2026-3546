@@ -239,6 +239,9 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
     if aosp.as_ref().is_some_and(|aosp| aosp.metadata("pre-device") != Some("a53x")) { bail!("AOSP ZIP is not for a53x") }
     if let Some(aosp) = &aosp { aosp.validate_firmware(stock.firmware())?; }
+    let aosp_catalog = if aosp.is_some() {
+        Some(Catalog::open(o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?)?)
+    } else { None };
     let keys = Keys::load(&root, &cfg.signing)?;
     let mut physical = inputs(o.images, &cfg.android.image_rules)?;
     if let Some(aosp) = &aosp {
@@ -292,6 +295,9 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     let mut signed_leaves = BTreeMap::new();
     for (name, image) in logical {
         let rule = &cfg.android.logical_rules[&name];
+        let image = if let Some(catalog) = &aosp_catalog {
+            codesigner::add_signer_info(image, catalog.signer_info(cfg.android.st2_key_type, &name)?)?
+        } else { image };
         let built = independent::sign(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)?;
         let descriptor = built.descriptor.context("signed logical image has no AVB descriptor")?;
         signed_leaves.insert(name.clone(), vbmeta_build::Image { image: built.image.clone(), descriptor: Some(descriptor) });
@@ -313,8 +319,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
             let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, targets)?;
             if super_image.metadata.device_size() != android::super_device_size(&base, &cfg)? { bail!("AOSP super device size differs from base super") }
             let sparse = sparse::encode(super_image.raw, 4096)?;
-            let bl = o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?;
-            let seed = Catalog::open(bl)?.sparse_seed(cfg.android.st2_key_type, 4096)?;
+            let seed = aosp_catalog.as_ref().context("AOSP catalog is missing")?.sparse_seed(cfg.android.st2_key_type, 4096)?;
             let image = codesigner::sign_sparse(sparse, &seed, super_name, &keys)?;
             changed.insert(super_name.clone(), image);
             sources.clear();
@@ -519,6 +524,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     let aosp = options.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
     if aosp.as_ref().is_some_and(|aosp| aosp.metadata("pre-device") != Some("a53x")) { bail!("AOSP ZIP is not for a53x") }
     if let Some(aosp) = &aosp { aosp.validate_firmware(stock.firmware())?; }
+    let aosp_catalog = if aosp.is_some() { Some(Catalog::open(bl)?) } else { None };
     if aosp.is_some() && options.super_image.is_some() { bail!("--super cannot be combined with --aosp-zip") }
     let mut paths = options.images;
     if let Some(path) = options.super_image {
@@ -572,6 +578,9 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
         let mut signed = BTreeMap::new();
         for (name, source) in logical {
             let rule = &config.android.logical_rules[&name];
+            let source = if let Some(catalog) = &aosp_catalog {
+                codesigner::add_signer_info(source, catalog.signer_info(config.android.st2_key_type, &name)?)?
+            } else { source };
             let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation)?;
             if built.partition != rule.partition || built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
             signed.insert(name, built.image);
@@ -588,7 +597,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
             let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, targets)?;
             if super_image.metadata.device_size() != android::super_device_size(&input, &config)? { bail!("AOSP super device size differs from stock super") }
             let sparse = sparse::encode(super_image.raw, 4096)?;
-            let seed = Catalog::open(bl)?.sparse_seed(config.android.st2_key_type, 4096)?;
+            let seed = aosp_catalog.as_ref().context("AOSP catalog is missing")?.sparse_seed(config.android.st2_key_type, 4096)?;
             let image = codesigner::sign_sparse(sparse, &seed, &config.android.super_image, &keys)?;
             input.replace(&config.android.super_image, image)?;
         } else {
