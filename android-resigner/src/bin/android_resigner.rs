@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, env, ffi::OsString, path::PathBuf, process::Exi
 use anyhow::{bail, Context, Result};
 use android_resigner::resign::{
     BuildVbmetaOptions, RunOptions, SignImageOptions, build_vbmeta, sign_image, update_ap,
-    UpdateApOptions,
+    Soc, UpdateApOptions,
 };
 
 #[derive(Debug)]
@@ -67,7 +67,7 @@ enum Command {
 fn usage(program: &OsString) -> String {
     let program = PathBuf::from(program);
     format!(
-        "usage:\n  {0} AP CP CSC --bl BL_RESIGNED [options]\n  {0} update-ap --base AP_RESIGNED.tar.md5 [--bl BL_RESIGNED] [--image NAME=PATH]... [--logical NAME=PATH]... [--incremental] [-o OUTPUT]\n  {0} sign-image --from AP_RESIGNED.tar.md5 --name NAME INPUT OUTPUT\n  {0} build-vbmeta --from AP_RESIGNED.tar.md5 --image NAME=PATH... -o DIR\n\noptions: [--aosp-zip PATH] [--bl-output OUT] [--image NAME=PATH]... [--logical NAME=PATH]... [--super PATH] [-o AP_RESIGNED.tar.md5] [--root DIR] [--force]",
+        "usage:\n  {0} --soc {{s5e8825,s5e9925}} AP CP CSC --bl BL_RESIGNED [options]\n  {0} --soc {{s5e8825,s5e9925}} update-ap --base AP_RESIGNED.tar.md5 [--bl BL_RESIGNED] [--image NAME=PATH]... [--logical NAME=PATH]... [--incremental] [-o OUTPUT]\n  {0} --soc {{s5e8825,s5e9925}} sign-image --from AP_RESIGNED.tar.md5 --name NAME INPUT OUTPUT\n  {0} --soc {{s5e8825,s5e9925}} build-vbmeta --from AP_RESIGNED.tar.md5 --image NAME=PATH... -o DIR\n\noptions: [--aosp-zip PATH] [--bl-output OUT] [--image NAME=PATH]... [--logical NAME=PATH]... [--super PATH] [-o AP_RESIGNED.tar.md5] [--root DIR] [--force]",
         program.display()
     )
 }
@@ -354,24 +354,32 @@ fn parse_update_ap(program: &OsString, values: &[OsString]) -> Result<UpdateApAr
     })
 }
 
-fn parse_from(raw: impl IntoIterator<Item = OsString>) -> Result<Command> {
+fn parse_from(raw: impl IntoIterator<Item = OsString>) -> Result<(Soc, Command)> {
     let mut raw = raw.into_iter();
     let program = raw.next().unwrap_or_else(|| "android-resigner".into());
-    let values = raw.collect::<Vec<_>>();
-    match values.first().and_then(|item| item.to_str()) {
-        Some("sign-image") => Ok(Command::SignImage(parse_sign_image(&program, &values[1..])?)),
-        Some("build-vbmeta") => Ok(Command::BuildVbmeta(parse_build_vbmeta(&program, &values[1..])?)),
-        Some("update-ap") => Ok(Command::UpdateAp(parse_update_ap(&program, &values[1..])?)),
-        Some("build-ap") => Ok(Command::BuildAp(parse_full(&program, &values[1..])?)),
-        Some("full") => Ok(Command::Full(parse_full(&program, &values[1..])?)),
-        _ => Ok(Command::Full(parse_full(&program, &values)?)),
+    let mut values = raw.collect::<Vec<_>>();
+    if values.first().and_then(|item| item.to_str()) != Some("--soc") {
+        bail!("--soc is required\n{}", usage(&program))
     }
+    if values.len() < 2 { bail!("--soc needs a value\n{}", usage(&program)) }
+    let soc = Soc::parse(values[1].to_str().context("--soc must be UTF-8")?)?;
+    values.drain(..2);
+    let cmd = match values.first().and_then(|item| item.to_str()) {
+        Some("sign-image") => Command::SignImage(parse_sign_image(&program, &values[1..])?),
+        Some("build-vbmeta") => Command::BuildVbmeta(parse_build_vbmeta(&program, &values[1..])?),
+        Some("update-ap") => Command::UpdateAp(parse_update_ap(&program, &values[1..])?),
+        Some("build-ap") => Command::BuildAp(parse_full(&program, &values[1..])?),
+        Some("full") => Command::Full(parse_full(&program, &values[1..])?),
+        _ => Command::Full(parse_full(&program, &values)?),
+    };
+    Ok((soc, cmd))
 }
 
-fn parse() -> Result<Command> { parse_from(env::args_os()) }
+fn parse() -> Result<(Soc, Command)> { parse_from(env::args_os()) }
 
-fn full_options(args: FullArgs) -> RunOptions {
+fn full_options(soc: Soc, args: FullArgs) -> RunOptions {
     RunOptions {
+        soc,
         ap: args.ap,
         cp: args.cp,
         csc: args.csc,
@@ -388,8 +396,10 @@ fn full_options(args: FullArgs) -> RunOptions {
 }
 
 fn run() -> Result<()> {
-    let output = match parse()? {
+    let (soc, command) = parse()?;
+    let output = match command {
         Command::SignImage(args) => sign_image(SignImageOptions {
+            soc,
             source: args.source,
             name: args.name,
             input: args.input,
@@ -398,6 +408,7 @@ fn run() -> Result<()> {
             force: args.force,
         })?,
         Command::BuildVbmeta(args) => build_vbmeta(BuildVbmetaOptions {
+            soc,
             source: args.source,
             images: args.images,
             output: args.output,
@@ -405,6 +416,7 @@ fn run() -> Result<()> {
             force: args.force,
         })?,
         Command::UpdateAp(args) => update_ap(UpdateApOptions {
+            soc,
             base: args.base,
             bl: args.bl,
             bl_output: args.bl_output,
@@ -416,7 +428,7 @@ fn run() -> Result<()> {
             root: args.root,
             force: args.force,
         })?,
-        Command::BuildAp(args) | Command::Full(args) => android_resigner::resign::run(full_options(args))?,
+        Command::BuildAp(args) | Command::Full(args) => android_resigner::resign::run(full_options(soc, args))?,
     };
     println!("{}", output.display());
     Ok(())

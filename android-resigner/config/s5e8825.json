@@ -1,0 +1,258 @@
+{
+  "soc": "s5e8825",
+  "signing_type": 4,
+  "signing": {
+    "codesigner_type": 4,
+    "st2_tee_key": "signer/keys/4/st2t.pem",
+    "st2_ree_key": "signer/keys/4/st2r.pem",
+    "avb_private_key": "signer/keys/avb.pem",
+    "avb_public_key": "signer/keys/avb.pubkey"
+  },
+  "key_image": "fld.bin",
+  "vbmeta_image": "vbmeta.img",
+  "lk": {
+    "image": "sboot.bin",
+    "part": "lk.bin"
+  },
+  "images": [
+    {
+      "name": "fld.bin",
+      "avb": "fld",
+      "bundle": true,
+      "parts": [
+        {"name": "bl1.bin", "start": "0x0", "end": "0x3000", "stage": "st1"},
+        {"name": "tail.bin", "start": "0x3000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "harx.bin",
+      "avb": "harx",
+      "bundle": true,
+      "parts": [
+        {"name": "harx.bin", "start": "0x0", "end": "0x200000", "stage": "st2", "key": "ree"},
+        {"name": "tail.bin", "start": "0x200000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "keystorage.bin",
+      "avb": "keystorage",
+      "bundle": true,
+      "parts": [
+        {"name": "keystorage.bin", "start": "0x0", "end": "0x4000", "stage": "st2", "key": "tee", "avb_keys": true},
+        {"name": "tail.bin", "start": "0x4000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "ldfw.img",
+      "avb": "ldfw",
+      "bundle": true,
+      "parts": [
+        {"name": "ldfw.bin", "start": "0x0", "end": "0x3fc000", "stage": "st2", "key": "tee"},
+        {"name": "tail.bin", "start": "0x3fc000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "sboot.bin",
+      "avb": "bootloader",
+      "bundle": true,
+      "parts": [
+        {"name": "epbl.bin", "start": "0x0", "end": "0x13000", "stage": "st2", "key": "tee", "header": true},
+        {"name": "bl2.bin", "start": "0x13000", "end": "0x8b000", "stage": "st2", "key": "ree"},
+        {"name": "pad.bin", "start": "0x8b000", "end": "0xe9000", "stage": null},
+        {"name": "dpm.img", "start": "0xe9000", "end": "0xeb000", "stage": "st2", "key": "tee"},
+        {"name": "pad2.bin", "start": "0xeb000", "end": "0xed000", "stage": null},
+        {"name": "lk.bin", "start": "0xed000", "end": "0x4ed000", "stage": "st2", "key": "ree"},
+        {"name": "el3_mon.bin", "start": "0x4ed000", "end": "0x54d000", "stage": "st2", "key": "tee"},
+        {"name": "tail.bin", "start": "0x54d000", "end": null, "stage": null}
+      ]
+    },
+    {"name": "tzar.img", "bundle": true},
+    {
+      "name": "tzsw.img",
+      "avb": "tzsw",
+      "bundle": true,
+      "parts": [
+        {"name": "tzsw.bin", "start": "0x0", "end": "0x100000", "stage": "st2", "key": "tee"},
+        {"name": "tail.bin", "start": "0x100000", "end": null, "stage": null}
+      ]
+    },
+    {"name": "uh.bin", "bundle": true},
+    {"name": "up_param.bin", "stage": null, "key": null, "bundle": false, "version": false},
+    {"name": "vbmeta.img", "stage": null, "key": null, "bundle": true}
+  ],
+  "android": {
+    "archive": [
+      "boot.img",
+      "vendor_boot.img",
+      "dtbo.img",
+      "recovery.img",
+      "super.img",
+      "modem.bin",
+      "omr.img",
+      "prism.img",
+      "optics.img"
+    ],
+    "super_image": "super.img",
+    "vbmeta": ["vbmeta_system.img", "vbmeta.img"],
+    "st2_key_type": 1,
+    "avb_algorithm": "SHA256_RSA4096",
+    "avb_generation": {
+      "data_block": 4096,
+      "hash_block": 4096,
+      "fec_roots": 2,
+      "flags": 0,
+      "rollback_index": 0,
+      "rollback_location": 0,
+      "footer_version_major": 1,
+      "footer_version_minor": 0,
+      "release": "android-resigner",
+      "salt": {"mode": "stock-derived"}
+    },
+    "logical_rules": {
+      "system.img": {
+        "codesigner": "none",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "system",
+        "synthesize_missing_wrappers": true
+      },
+      "product.img": {
+        "codesigner": "none",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "product",
+        "synthesize_missing_wrappers": true
+      },
+      "system_ext.img": {
+        "codesigner": "none",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "system_ext",
+        "synthesize_missing_wrappers": true,
+        "optional": true
+      },
+      "vendor.img": {
+        "codesigner": "none",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "vendor",
+        "synthesize_missing_wrappers": true,
+        "filesystem": {"discover_firmware": true}
+      },
+      "odm.img": {
+        "codesigner": "none",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "odm",
+        "synthesize_missing_wrappers": true,
+        "optional": true
+      },
+      "vendor_dlkm.img": {
+        "codesigner": "none",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "vendor_dlkm",
+        "synthesize_missing_wrappers": true,
+        "optional": true
+      }
+    },
+    "dependencies": {
+      "super.img": ["system.img", "product.img", "system_ext.img", "vendor.img", "odm.img", "vendor_dlkm.img"],
+      "vbmeta_system.img": ["system.img", "product.img", "system_ext.img", "vendor.img", "odm.img", "vendor_dlkm.img"],
+      "vbmeta.img": [
+        "boot.img", "vendor_boot.img", "dtbo.img", "recovery.img", "prism.img", "optics.img",
+        "system.img", "product.img", "system_ext.img", "vendor.img", "odm.img", "vendor_dlkm.img"
+      ]
+    },
+    "image_rules": {
+      "boot.img": {
+        "codesigner": "normal",
+        "key": "auto",
+        "avb": "hash",
+        "partition": "boot",
+        "synthesize_missing_wrappers": true
+      },
+      "vendor_boot.img": {
+        "codesigner": "normal",
+        "key": "auto",
+        "avb": "hash",
+        "partition": "vendor_boot",
+        "synthesize_missing_wrappers": true,
+        "ramdisk": {
+          "names": ["vendor_ramdisk00", "ramdisk00"],
+          "discover_firmware": true
+        }
+      },
+      "dtbo.img": {
+        "codesigner": "normal",
+        "key": "auto",
+        "avb": "hash",
+        "partition": "dtbo",
+        "synthesize_missing_wrappers": true
+      },
+      "recovery.img": {
+        "codesigner": "normal",
+        "key": "auto",
+        "avb": "hash",
+        "partition": "recovery",
+        "synthesize_missing_wrappers": true,
+        "ramdisk": {
+          "names": ["ramdisk"],
+          "discover_firmware": true,
+          "require_all": false
+        }
+      },
+      "super.img": {
+        "codesigner": "sparse",
+        "key": "auto",
+        "avb": "none",
+        "partition": "super",
+        "synthesize_missing_wrappers": true,
+        "filesystem": {"discover_firmware": true},
+        "super_image": true
+      },
+      "modem.bin": {
+        "codesigner": "normal",
+        "key": "auto",
+        "avb": "none",
+        "partition": "modem",
+        "synthesize_missing_wrappers": true
+      },
+      "omr.img": {
+        "codesigner": "sparse",
+        "key": "auto",
+        "avb": "none",
+        "partition": "omr",
+        "synthesize_missing_wrappers": true
+      },
+      "prism.img": {
+        "codesigner": "sparse",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "prism",
+        "synthesize_missing_wrappers": true
+      },
+      "optics.img": {
+        "codesigner": "sparse",
+        "key": "auto",
+        "avb": "hashtree",
+        "partition": "optics",
+        "synthesize_missing_wrappers": true
+      },
+      "vbmeta_system.img": {
+        "codesigner": "standalone-vbmeta",
+        "key": "auto",
+        "avb": "standalone",
+        "partition": "vbmeta_system",
+        "synthesize_missing_wrappers": true
+      },
+      "vbmeta.img": {
+        "codesigner": "standalone-vbmeta",
+        "key": "auto",
+        "avb": "standalone",
+        "partition": "vbmeta",
+        "synthesize_missing_wrappers": true
+      }
+    }
+  }
+}

@@ -8,21 +8,27 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "signer"))
+import signer
+from layout import SOCS, get
+
 LK_BASE = 0
 PAGE_SIZE = 0x1000
 CODE_OFFSET = 0x100
 CODE_CAPACITY = 0xEE0
+STAGE_OFFSET = 0x50
+CONTEXT_SIZE = 0x110
+STACK_OFFSET = 0x10000
+PTE_PRIV_RO = 2 << 6
+RESULT_OK = 0x8825EACE
 
 
-def load_lk(path):
-    if not path.name.endswith(".tar.md5"):
-        return path.read_bytes()
-    sys.path.insert(0, str(HERE / "signer"))
-    import signer
-    from layout import BY_NAME, LK_IMAGE, LK_PART
-    images = signer._members(path)
-    part = next(item for item in BY_NAME[LK_IMAGE].parts if item.name == LK_PART)
-    return images[LK_IMAGE][part.start:part.end]
+def load_lk(path, soc, raw):
+    layout = get(soc)
+    if raw:
+        return path.read_bytes(), layout
+    layout, images = signer.load_stock(path, soc)
+    return layout.lk(images), layout
 
 
 def u32(data, offset):
@@ -64,6 +70,38 @@ def add_imm(insn):
     if insn >> 22 & 1:
         val <<= 12
     return val, insn & 31, insn >> 5 & 31
+
+
+def l2_table(data):
+    site = unique(data, struct.pack(
+        "<3I", 0x9AC80A81, 0x91000063, 0xB279026D,
+    ), "L2 table")
+    page, reg = adrp(u32(data, site - 4), LK_BASE + site - 4)
+    val, dst, src = add_imm(u32(data, site + 4))
+    if (reg, dst, src) != (3, 3, 3):
+        raise RuntimeError("L2 table registers")
+    return page + val
+
+
+def control_fns(data):
+    restore = unique(data, struct.pack(
+        "<4I", 0x9100001F, 0xA9500BE1, 0xD5384240, 0xD342FC00,
+    ), "context restore")
+    disable_tail = unique(data, struct.pack(
+        "<6I", 0xD5381000, 0x927FF800, 0x927DF800,
+        0xD5181000, 0xD5033FDF, 0xD65F03C0,
+    ), "MMU disable")
+    enable_tail = unique(data, struct.pack(
+        "<6I", 0xD5381000, 0xB2400000, 0xB27E0000,
+        0xD5181000, 0xD5033FDF, 0xD65F03C0,
+    ), "MMU enable")
+    disable = disable_tail - 0x40
+    enable = enable_tail - 0x40
+    head = (0xD5384240, 0xD342FC00, 0xF1000C1F)
+    if (tuple(u32(data, disable + i * 4) for i in range(3)) != head or
+            tuple(u32(data, enable + i * 4) for i in range(3)) != head):
+        raise RuntimeError("MMU control prologue")
+    return LK_BASE + restore, LK_BASE + disable, LK_BASE + enable
 
 
 def mov_wide(insn):
@@ -165,7 +203,7 @@ def parallel(data):
     return candidates[0]
 
 
-def named_fn(data, value, vtable_offset):
+def named_fn(data, value):
     prologue = (0xA9BD7BFD, 0xA90157F6, 0xA9024FF4, 0x910003FD)
     starts = set()
     for ref, _, _ in str_refs(data, value):
@@ -182,11 +220,21 @@ def named_fn(data, value, vtable_offset):
     if len(starts) != 1:
         raise RuntimeError(f"{value.decode()} funcs: {starts}")
     start = starts.pop()
-    load = 0xF9400008 | ((vtable_offset // 8) << 10)
-    body = [u32(data, offset) for offset in range(start, min(len(data), start + 0x100), 4)]
-    if load not in body or 0xD63F0100 not in body:
+    calls = []
+    end = min(len(data), start + 0x100)
+    for offset in range(start, end - 4, 4):
+        load = u32(data, offset)
+        if load & 0xFFC003E0 != 0xF9400000:
+            continue
+        reg = load & 31
+        call = 0xD63F0000 | (reg << 5)
+        if any(u32(data, at) == call
+               for at in range(offset + 4, min(end, offset + 0x30), 4)):
+            calls.append(((load >> 10) & 0xFFF) * 8)
+    calls = sorted(set(calls))
+    if len(calls) != 1:
         raise RuntimeError(f"{value.decode()} vtable")
-    return LK_BASE + start
+    return LK_BASE + start, calls[0]
 
 
 def io_shift(data, target):
@@ -476,11 +524,11 @@ def screen_fns(data):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image", type=Path)
+    ap.add_argument("--soc", required=True, choices=SOCS)
+    ap.add_argument("--raw-lk", action="store_true")
     a = ap.parse_args()
     path = a.image.resolve()
-    data = load_lk(path)
-    if b"s5e8825\0" not in data:
-        raise RuntimeError("image is not an S5E8825 LK build")
+    data, layout = load_lk(path, a.soc, a.raw_lk)
 
     global LK_BASE
     LK_BASE, _, bss_lo, bss_hi = image_map(data)
@@ -494,7 +542,10 @@ def main():
         ent = struct.unpack_from("<5Q", data, off)
         if ent[1] == in_base and ent[2] >= in_base + in_total and ent[3] == in_base:
             maps.append(ent)
-    if len(maps) != 1 or maps[0][4] & ((1 << 53) | (1 << 54)):
+    if len(maps) != 1:
+        raise RuntimeError(f"input mapping: {maps}")
+    if (layout.code_area == "download" and
+            maps[0][4] & ((1 << 53) | (1 << 54))):
         raise RuntimeError("payload staging area is not executable")
 
     slots = in_total // in_slot
@@ -510,10 +561,35 @@ def main():
     code_slot = slots - 1
     pack_slot = code_slot - 1
     code_base = in_base + code_slot * in_slot
-    code = code_base + CODE_OFFSET
+    code_store = code_base + CODE_OFFSET
+    if layout.code_area == "download":
+        code = code_store
+        pte = pte_value = 0
+        stage_store = stage = 0
+        restore = mmu_off = mmu_on = 0
+    else:
+        block_size = 0x200000
+        alias = layout.alias_base
+        physical = code_store & -block_size
+        code = alias + code_store - physical
+        pte = l2_table(data) + (alias >> 21) * 8
+        flags = (maps[0][4] | PTE_PRIV_RO) & ~((1 << 53) | (1 << 54))
+        pte_value = physical | flags
+        pte_off = pte - LK_BASE
+        if (alias % block_size or alias + block_size > 1 << 36 or
+                pte_value & 3 != 1 or not 0 <= pte_off <= len(data) - 8 or
+                any(data[pte_off:pte_off + 8])):
+            raise RuntimeError("invalid loader alias")
+        stage_store = code_base + STAGE_OFFSET
+        stage = alias + stage_store - physical
+        restore, mmu_off, mmu_on = control_fns(data)
+    code_off = CODE_OFFSET
+    code_cap = CODE_CAPACITY
     reserve = block
     pack_base = in_base + pack_slot * in_slot
     pack = pack_base + reserve
+    context = pack_base if pte else 0
+    stack = pack_base + STACK_OFFSET if pte else 0
     write = reply
     cb_off = callback - write
     ctl_len = cb_off + 8
@@ -528,24 +604,43 @@ def main():
     pit = work - 4 * PAGE_SIZE
     pack_cap = min(pit - pack, par_slot - reserve)
     if (reply_buf + 8 > code_end or pack_cap <= 0 or
-            code + CODE_CAPACITY > code_base + PAGE_SIZE or
+            code_store + code_cap > code_base + PAGE_SIZE or
+            pte and (stage_store + 0xB0 != code_store or
+                     context + CONTEXT_SIZE > stack or
+                     stack >= pack) or
             reserve >= par_slot or pit <= pack):
         raise RuntimeError("invalid loader memory layout")
-    bread = named_fn(data, b"blk_bread", 168)
-    bwrite = named_fn(data, b"blk_bwrite", 176)
+    bread, read_slot = named_fn(data, b"blk_bread")
+    bwrite, write_slot = named_fn(data, b"blk_bwrite")
+    if write_slot != read_slot + 8:
+        raise RuntimeError("block I/O vtable")
     shift = io_shift(data, bread)
     sha256 = sha256_fn(data)
     cursor, screen, update = screen_fns(data)
+    soc_id = int(layout.soc[3:])
 
     (HERE / "offsets.py").write_text(
+        f"SOC = {layout.soc!r}\n"
+        f"SOC_ID = {soc_id}\n"
+        f"RESULT_OK = {RESULT_OK:#x}\n"
         f"BLOCK = {block:#x}\n"
         f"CB_OFF = {cb_off:#x}\n"
         f"OUT_BASE = {out_base:#x}\n"
         f"CTL_LEN = {ctl_len:#x}\n"
         f"WALK_LEN = {walk:#x}\n"
-        f"CODE_OFF = {CODE_OFFSET:#x}\n"
+        f"CODE_OFF = {code_off:#x}\n"
         f"CODE_ADDR = {code:#x}\n"
-        f"CODE_MAX = {CODE_CAPACITY:#x}\n"
+        f"CODE_STORE_ADDR = {code_store:#x}\n"
+        f"CODE_MAX = {code_cap:#x}\n"
+        f"PTE_ADDR = {pte:#x}\n"
+        f"PTE_VALUE = {pte_value:#x}\n"
+        f"STAGE_STORE_ADDR = {stage_store:#x}\n"
+        f"STAGE_ADDR = {stage:#x}\n"
+        f"CONTEXT_ADDR = {context:#x}\n"
+        f"STACK_ADDR = {stack:#x}\n"
+        f"CONTEXT_RESTORE = {restore:#x}\n"
+        f"MMU_DISABLE = {mmu_off:#x}\n"
+        f"MMU_ENABLE = {mmu_on:#x}\n"
         f"PACK_SLOT = {pack_slot}\n"
         f"RESERVE = {reserve:#x}\n"
         f"PACK_ADDR = {pack:#x}\n"
@@ -569,6 +664,8 @@ def main():
         encoding="utf-8",
     )
     loader_profile = (
+        f"#define LOADER_SOC_ID {soc_id}U\n"
+        f"#define RESULT_OK {RESULT_OK:#x}U\n"
         f"#define SEND_CALLBACK {callback:#x}ULL\n"
         f"#define SEND_CALLBACK_DEFAULT {send:#x}ULL\n"
         f"#define BLK_BREAD {bread:#x}ULL\n"
@@ -587,10 +684,10 @@ def main():
         f"#define LZMA_WORKSPACE_ADDRESS {work:#x}ULL\n"
         f"#define LZMA_WORKSPACE_CAPACITY {PAGE_SIZE * 4:#x}U\n"
         f"#define CODE_ADDRESS {code:#x}ULL\n"
-        f"#define CODE_CAPACITY {CODE_CAPACITY:#x}U\n"
+        f"#define CODE_CAPACITY {code_cap:#x}U\n"
         f"#define BUNDLE_ADDRESS {pack:#x}ULL\n"
         f"#define BUNDLE_CAPACITY {pack_cap:#x}U\n"
-        f"#define PAYLOAD_CAPACITY {CODE_CAPACITY:#x}U\n"
+        f"#define PAYLOAD_CAPACITY {code_cap:#x}U\n"
     )
     (HERE / "loader_profile.h").write_text(
         loader_profile,
@@ -604,7 +701,7 @@ def main():
         "    __code_start = .;\n"
         "    .code : { KEEP(*(.text.entry)) KEEP(*(.text.keep)) *(.text*) *(.rodata*) *(.data*) }\n"
         "    __code_end = .;\n"
-        f"    ASSERT(__code_end - __code_start <= {CODE_CAPACITY:#x}, \"code exceeds {CODE_CAPACITY} bytes\")\n"
+        f"    ASSERT(__code_end - __code_start <= {code_cap:#x}, \"code exceeds {code_cap} bytes\")\n"
         "    .bss (NOLOAD) : { *(.bss*) *(COMMON) }\n"
         "    ASSERT(SIZEOF(.bss) == 0, \"payload must not use BSS\")\n"
         "    /DISCARD/ : { *(.comment*) *(.note*) *(.eh_frame*) }\n"
@@ -612,11 +709,14 @@ def main():
         encoding="utf-8",
     )
     print(
-        f"{path} {hashlib.sha256(data).hexdigest()} base={LK_BASE:#x} "
+        f"{layout.soc}: {path} {hashlib.sha256(data).hexdigest()} base={LK_BASE:#x} "
         f"in={in_base:#x} pack={pack:#x} code={code:#x} out={out_base:#x} "
         f"write={write:#x} cb={callback:#x} walk={walk:#x}"
     )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        raise SystemExit(f"error: {exc}")

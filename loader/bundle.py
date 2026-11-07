@@ -5,16 +5,14 @@ import importlib.util
 import lzma
 import struct
 import sys
-import tarfile
 from pathlib import Path
-
-import lz4.frame
-
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "signer"))
-from layout import IMAGES, KEY_IMAGE, SIGNING_TYPE
+import cs
+import signer
+from layout import SOCS
 
 
 MAGIC = 0x42333541
@@ -24,8 +22,6 @@ ENTRY = struct.Struct("<32sIIII32s48s")
 PIT_MAGIC = 0x12349876
 PIT_HEADER = 0x1C
 PIT_ENTRY = 0x84
-FILES = tuple(image.name for image in IMAGES if image.bundle)
-ALL_FILES = tuple(image.name for image in IMAGES)
 DICT_SIZE = 1 << 21
 
 
@@ -38,21 +34,6 @@ def cstr(value: str) -> bytes:
     if not data or len(data) >= 32:
         raise ValueError(f"invalid bundle name: {value}")
     return data.ljust(32, b"\0")
-
-
-def load(path: Path) -> dict[str, bytes]:
-    out = {}
-    with tarfile.open(path, "r:*") as tar:
-        items = {item.name: item for item in tar.getmembers() if item.isfile()}
-        for name in ALL_FILES:
-            item = items.get(f"{name}.lz4")
-            if item is None:
-                raise ValueError(f"missing {name}.lz4")
-            src = tar.extractfile(item)
-            if src is None:
-                raise ValueError(f"cannot read {name}.lz4")
-            out[name] = lz4.frame.decompress(src.read())
-    return out
 
 
 def read_pit(data: bytes) -> list[dict]:
@@ -105,19 +86,22 @@ def main() -> None:
     ap.add_argument("pit", type=Path)
     ap.add_argument("out", type=Path)
     ap.add_argument("header", type=Path)
+    ap.add_argument("--soc", required=True, choices=SOCS)
     a = ap.parse_args()
 
-    root = ROOT
-    import cs
-    import signer
-
-    imgs = load(a.bl)
-    signer.check(imgs)
+    layout, imgs = signer.load_stock(a.bl, a.soc)
+    signer.check(imgs, layout)
     pit = a.pit.read_bytes()
-    _, ree = cs.stock_keys(imgs[KEY_IMAGE], SIGNING_TYPE)
-    cs.verify_st2(pit, ree, "ree", False, SIGNING_TYPE)
+    _, ree = cs.stock_keys(imgs[layout.key_image], layout.signing_type)
+    cs.verify_st2(pit, ree, "ree", False, layout.signing_type)
+    bl_id = cs.signer_info(imgs[layout.key_image])
+    pit_id = cs.signer_info(pit)
+    if (pit_id["product"], pit_id["keyset"]) != (
+            bl_id["product"], bl_id["keyset"]):
+        raise ValueError("BL/PIT product identity mismatch")
     parts = read_pit(pit)
-    src = [(name, imgs[name], 0) for name in FILES]
+    files = tuple(image.name for image in layout.images if image.bundle)
+    src = [(name, imgs[name], 0) for name in files]
     src.append((a.pit.name, pit, 1))
 
     filt = [{
@@ -164,18 +148,19 @@ def main() -> None:
     )
     data = hdr + body
 
-    cfg = load_py(root / "offsets.py", "s5e8825_offsets")
+    cfg = load_py(ROOT / "offsets.py", "loader_offsets")
     if len(data) > cfg.PACK_MAX:
         raise ValueError("bundle too large")
     a.out.write_bytes(data)
     a.header.write_text(
         "#pragma once\n"
+        f"#define BUNDLE_SOC_ID {int(layout.soc[3:])}U\n"
         f"#define BUNDLE_EXPECTED_COUNT {len(packs)}U\n"
         f"#define BUNDLE_PIT_INDEX {pit_i}U\n"
         f"#define BUNDLE_DICTIONARY_SIZE {DICT_SIZE:#x}U\n"
         f"#define BUNDLE_SIZE {len(data):#x}U\n"
     )
-    print(f"{a.out} {len(data):#x} free={cfg.PACK_MAX - len(data):#x}")
+    print(f"{layout.soc}: {a.out} {len(data):#x} free={cfg.PACK_MAX - len(data):#x}")
 
 
 if __name__ == "__main__":

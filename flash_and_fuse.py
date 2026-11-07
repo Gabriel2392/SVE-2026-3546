@@ -17,20 +17,32 @@ from offsets import (
     CODE_ADDR,
     CODE_MAX,
     CODE_OFF,
+    CODE_STORE_ADDR,
     CODE_SLOT,
+    CONTEXT_ADDR,
+    CONTEXT_RESTORE,
     CTL_LEN,
+    MMU_DISABLE,
+    MMU_ENABLE,
+    PACK_ADDR,
     PACK_MAX,
     PACK_SLOT,
     PAR_SLOT,
     REPLY_ADDR,
     RESERVE,
+    RESULT_OK,
+    SOC,
+    STACK_ADDR,
+    STAGE_ADDR,
+    STAGE_STORE_ADDR,
+    PTE_ADDR,
+    PTE_VALUE,
     WALK_LEN,
     WRITE_ADDR,
 )
 
 ROOT = Path(__file__).resolve().parent
 PIT_ENT = 0x84
-MARK = 0x8825EACE
 
 
 def pkt(op, sub=0, args=()):
@@ -136,6 +148,76 @@ def load_bundle(path):
     return data
 
 
+def invoke(dev, dst, target, reply, timeout=30000):
+    ctl = bytearray(CTL_LEN)
+    struct.pack_into("<Q", ctl, 0, reply)
+    struct.pack_into("<Q", ctl, CB_OFF, target)
+    return put_comp(dev, len(ctl), dst, bytes(ctl), timeout)
+
+
+def branch(pc, target, link=False):
+    delta = target - pc
+    if delta & 3 or not -(1 << 27) <= delta < 1 << 27:
+        raise RuntimeError("stage branch")
+    return (0x94000000 if link else 0x14000000) | (delta >> 2 & 0x3FFFFFF)
+
+
+def literal(pc, target, reg):
+    delta = target - pc
+    if delta & 3 or not -(1 << 20) <= delta < 1 << 20:
+        raise RuntimeError("stage literal")
+    return 0x58000000 | (delta >> 2 & 0x7FFFF) << 5 | reg
+
+
+def stage_code():
+    lit = STAGE_STORE_ADDR + 0x48
+    words = [
+        literal(STAGE_STORE_ADDR, lit, 9),
+        0xD5087629,
+        0xD5033F9F,
+        literal(STAGE_STORE_ADDR + 0xC, lit + 8, 10),
+        0xF900012A,
+        0xD5033F9F,
+        0xD508871F,
+        0xD5033F9F,
+        0xD5033FDF,
+        literal(STAGE_STORE_ADDR + 0x24, lit + 16, 30),
+        literal(STAGE_STORE_ADDR + 0x28, lit + 24, 16),
+        0xD61F0200,
+        literal(STAGE_ADDR + 0x30, STAGE_ADDR + 0x68, 0),
+        0x52800101,
+        branch(STAGE_ADDR + 0x38, CODE_ADDR, True),
+        0xD503205F,
+        branch(STAGE_ADDR + 0x40, STAGE_ADDR + 0x3C),
+        0xD503201F,
+    ]
+    data = bytearray(struct.pack(f"<{len(words)}I", *words))
+    data += struct.pack(
+        "<5Q", PTE_ADDR, PTE_VALUE, STAGE_ADDR + 0x30,
+        MMU_ENABLE, REPLY_ADDR,
+    )
+    return bytes(data)
+
+
+def context():
+    data = bytearray(0x110)
+    struct.pack_into("<4Q", data, 0xF0, STAGE_STORE_ADDR,
+                     STACK_ADDR, MMU_DISABLE, 0x3C5)
+    return bytes(data)
+
+
+def walk(dev, dst, left, done, total, mark):
+    while left:
+        size = min(left, BLOCK)
+        put_comp(dev, size, dst)
+        left -= size
+        done += size
+        if done >= mark or done == total:
+            print(f"walk {done:#x}/{total:#x}", flush=True)
+            mark = done + 0x4000000
+    return done, mark
+
+
 def run(code_path, bundle_path):
     code = code_path.read_bytes()
     bundle = load_bundle(bundle_path)
@@ -156,35 +238,38 @@ def run(code_path, bundle_path):
         cmd(dev, 102, 0)
 
         print("stage", flush=True)
+        reserve = bytearray(RESERVE)
+        if CONTEXT_ADDR:
+            if CONTEXT_ADDR != PACK_ADDR - RESERVE:
+                raise RuntimeError("context address")
+            reserve[:0x110] = context()
         for slot in range(CODE_SLOT):
             if slot == PACK_SLOT:
                 put(dev, RESERVE + len(bundle), scratch, 0,
-                    bytes(RESERVE) + bundle)
+                    reserve + bundle)
             else:
                 put(dev, 1, scratch, 1)
-        put(dev, CODE_OFF + len(code), boot, 0, bytes(CODE_OFF) + code)
+        staged = bytearray(CODE_OFF + len(code))
+        staged[CODE_OFF:] = code
+        if STAGE_STORE_ADDR:
+            off = CODE_OFF + STAGE_STORE_ADDR - CODE_STORE_ADDR
+            transition = stage_code()
+            if off < 0 or off + len(transition) > CODE_OFF:
+                raise RuntimeError("stage layout")
+            staged[off:off + len(transition)] = transition
+        put(dev, len(staged), boot, 0, staged)
         put(dev, 1, scratch, 1)
 
         cmd(dev, 100, 5, (8,))
         cmd(dev, 102, 5)
-        left = WALK_LEN
-        mark = 0x4000000
-        while left:
-            size = min(left, BLOCK)
-            put_comp(dev, size, scratch)
-            left -= size
-            done = WALK_LEN - left
-            if done >= mark or not left:
-                print(f"walk {done:#x}/{WALK_LEN:#x}", flush=True)
-                mark = done + 0x4000000
+        walk(dev, scratch, WALK_LEN, 0, WALK_LEN, 0x4000000)
 
-        ctl = bytearray(CTL_LEN)
-        struct.pack_into("<Q", ctl, 0, REPLY_ADDR)
-        struct.pack_into("<Q", ctl, CB_OFF, CODE_ADDR)
         print(f"trigger {WRITE_ADDR:#x}", flush=True)
         start = time.monotonic()
-        ret = put_comp(dev, len(ctl), boot, bytes(ctl), 600000)
-        if ret != MARK:
+        target = CONTEXT_RESTORE or CODE_ADDR
+        reply = CONTEXT_ADDR or REPLY_ADDR
+        ret = invoke(dev, boot, target, reply, 600000)
+        if ret != RESULT_OK:
             raise RuntimeError(f"loader {ret:#x}")
         print(f"done {time.monotonic() - start:.1f}s", flush=True)
     finally:
@@ -196,9 +281,12 @@ def run(code_path, bundle_path):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--soc", required=True, choices=("s5e8825", "s5e9925"))
     ap.add_argument("code", type=Path, nargs="?", default=ROOT / "loader.bin")
     ap.add_argument("--bundle", type=Path, default=ROOT / "loader/bundle.bin")
     args = ap.parse_args()
+    if args.soc != SOC:
+        raise ValueError(f"generated loader is for {SOC}, not {args.soc}")
     run(args.code.resolve(), args.bundle.resolve())
 
 

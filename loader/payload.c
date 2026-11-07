@@ -14,7 +14,6 @@ typedef unsigned long u64;
 #define PIT_TRAILER 0x310U
 #define PIT_SHIFT 12U
 #define CHUNK 0x100000U
-#define RESULT_OK 0x8825EACEU
 #define SMC_OTP_CONTROL 0xC2001014U
 #define OTP_WRITE_KEY2 0x16U
 #define OTP_USE_KEY2 0x17U
@@ -306,6 +305,7 @@ _Static_assert(sizeof(struct header) == 64, "bundle header");
 _Static_assert(sizeof(struct entry) == 128, "bundle entry");
 _Static_assert(sizeof(struct pit_entry) == PIT_ENTRY, "PIT entry");
 _Static_assert(sizeof(struct otp_data) == 192, "OTP data");
+_Static_assert(LOADER_SOC_ID == BUNDLE_SOC_ID, "SoC mismatch");
 _Static_assert(BUNDLE_DICTIONARY_SIZE == LZMA_DICTIONARY_SIZE,
                "LZMA dictionary");
 _Static_assert(LZMA_WORKSPACE_CAPACITY >= LZMA_WORKSPACE_REQUIRED,

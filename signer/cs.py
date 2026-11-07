@@ -16,6 +16,8 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
 ST1_FOOTER = 2360
 ST2_FOOTER = 0x210
 ST2_SKIP = 0x200
+INFO_SIZE = 0x100
+INFO_MARKER = b"SignerVer03"
 
 
 def _u32(buf: bytes | bytearray, off: int) -> int:
@@ -33,6 +35,23 @@ def boundary(buf: bytes | bytearray) -> int:
             raise ValueError("invalid AVB boundary")
         return val
     return len(buf)
+
+
+def signer_info(buf: bytes | bytearray) -> dict[str, str]:
+    off = boundary(buf) - ST2_FOOTER - INFO_SIZE
+    if off < 0 or bytes(buf[off:off + len(INFO_MARKER)]) != INFO_MARKER:
+        raise ValueError("CodeSigner metadata is missing")
+
+    def text(start: int, size: int) -> str:
+        raw = bytes(buf[off + start:off + start + size]).split(b"\0", 1)[0]
+        return raw.decode("ascii")
+
+    return {
+        "firmware": text(0x20, 0x20),
+        "product": text(0x50, 0x20),
+        "keyset": text(0x70, 0x20),
+        "image": text(0x9C, 0x64),
+    }
 
 
 def pub_blob(key: ec.EllipticCurvePrivateKey) -> bytes:

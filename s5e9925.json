@@ -1,0 +1,89 @@
+{
+  "soc": "s5e9925",
+  "signing": {
+    "codesigner_type": 4,
+    "st2_tee_key": "signer/keys/4/st2t.pem",
+    "st2_ree_key": "signer/keys/4/st2r.pem",
+    "avb_private_key": "signer/keys/avb.pem",
+    "avb_public_key": "signer/keys/avb.pubkey"
+  },
+  "key_image": "fld.bin",
+  "vbmeta_image": "vbmeta.img",
+  "lk": {
+    "image": "sboot.bin",
+    "part": "lk.bin"
+  },
+  "loader": {
+    "code_area": "alias",
+    "alias_base": "0xbda000000"
+  },
+  "images": [
+    {
+      "name": "fld.bin",
+      "avb": "fld",
+      "bundle": true,
+      "parts": [
+        {"name": "stsocbl1.bin", "start": "0x0", "end": "0x1000", "stage": "st1"},
+        {"name": "dbgc.bin", "start": "0x1000", "end": "0x14000", "stage": "st2", "key": "tee"},
+        {"name": "hostbl1.bin", "start": "0x14000", "end": "0x30000", "stage": "st2", "key": "tee"},
+        {"name": "tail.bin", "start": "0x30000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "harx.bin",
+      "avb": "harx",
+      "bundle": true,
+      "parts": [
+        {"name": "harx.bin", "start": "0x0", "end": "0x200000", "stage": "st2", "key": "ree"},
+        {"name": "tail.bin", "start": "0x200000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "keystorage.bin",
+      "avb": "keystorage",
+      "bundle": true,
+      "parts": [
+        {"name": "keystorage.bin", "start": "0x0", "end": "0x4000", "stage": "st2", "key": "tee", "avb_keys": true},
+        {"name": "tail.bin", "start": "0x4000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "ldfw.img",
+      "avb": "ldfw",
+      "bundle": true,
+      "parts": [
+        {"name": "ldfw.bin", "start": "0x0", "end": "0x3fc000", "stage": "st2", "key": "tee"},
+        {"name": "tail.bin", "start": "0x3fc000", "end": null, "stage": null}
+      ]
+    },
+    {
+      "name": "sboot.bin",
+      "avb": "bootloader",
+      "bundle": true,
+      "parts": [
+        {"name": "epbl.bin", "start": "0x0", "end": "0x17000", "stage": "st2", "key": "tee", "header": true},
+        {"name": "bl2.bin", "start": "0x17000", "end": "0x9c000", "stage": "st2", "key": "ree"},
+        {"name": "pad.bin", "start": "0x9c000", "end": "0x115000", "stage": null},
+        {"name": "dpm.img", "start": "0x115000", "end": "0x117000", "stage": "st2", "key": "tee"},
+        {"name": "pad2.bin", "start": "0x117000", "end": "0x119000", "stage": null},
+        {"name": "lk.bin", "start": "0x119000", "end": "0x519000", "stage": "st2", "key": "ree"},
+        {"name": "el3_mon.bin", "start": "0x519000", "end": "0x579000", "stage": "st2", "key": "tee"},
+        {"name": "tail.bin", "start": "0x579000", "end": null, "stage": null}
+      ]
+    },
+    {"name": "tzar.img", "bundle": true},
+    {
+      "name": "tzsw.img",
+      "avb": "tzsw",
+      "bundle": true,
+      "parts": [
+        {"name": "tzsw.bin", "start": "0x0", "end": "0x100000", "stage": "st2", "key": "tee"},
+        {"name": "tail.bin", "start": "0x100000", "end": null, "stage": null}
+      ]
+    },
+    {"name": "uh.bin", "bundle": true},
+    {"name": "ssp.img", "stage": null, "key": null, "bundle": true, "version": false, "preserve": true},
+    {"name": "up_param.bin", "stage": null, "key": null, "bundle": false, "version": false},
+    {"name": "vbmeta.img", "stage": "st2", "key": "ree", "bundle": true}
+  ]
+}

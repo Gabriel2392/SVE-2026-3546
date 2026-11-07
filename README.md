@@ -1,6 +1,6 @@
 # SVE-2026-3546 - Unsigned code loading for S-LK
 
-This PoC uses it to fuse Secure Boot KEY2 and flash re-signed bootloader files on s5e8825 platform (no others for now, i'm lazy).
+This PoC uses it to fuse Secure Boot KEY2 and flash re-signed bootloader files on s5e8825 and s5e9925.
 
 ## Demo
 
@@ -30,7 +30,7 @@ Android signer commands: [android-resigner/README.md](android-resigner/README.md
 ## 1. Sign BL and PIT
 
 ```sh
-./sign_bl.py BL.tar.md5 device.pit
+./sign_bl.py --soc s5e9925 BL.tar.md5 device.pit
 ```
 
 Outputs:
@@ -40,16 +40,16 @@ BL_RESIGNED.tar.md5
 device_RESIGNED.pit
 ```
 
-## 2. Find offsets. Only for s5e8825. For other platforms you're on your own.
+## 2. Find offsets
 
 ```sh
-./resolve.py BL_RESIGNED.tar.md5
+./resolve.py --soc s5e9925 BL_RESIGNED.tar.md5
 ```
 
 ## 3. Build the loader
 
 ```sh
-./build_loader.sh BL_RESIGNED.tar.md5 device_RESIGNED.pit
+./build_loader.sh --soc s5e9925 BL_RESIGNED.tar.md5 device_RESIGNED.pit
 ```
 
 Outputs:
@@ -63,7 +63,7 @@ loader/bundle.bin
 ## 4. Run
 
 ```sh
-./flash_and_fuse.py
+./flash_and_fuse.py --soc s5e9925
 ```
 
 ## Disclaimer

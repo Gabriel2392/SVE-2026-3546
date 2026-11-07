@@ -33,8 +33,28 @@ use input::StockInput;
 use stock::{CodeSignerRecord, ImageRecord, Stock, SourceHashes, sha256_bytes};
 use templates::Catalog;
 
+const CONFIG_DIR: &str = "android-resigner/config";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Soc { S5e8825, S5e9925 }
+
+impl Soc {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "s5e8825" => Ok(Self::S5e8825),
+            "s5e9925" => Ok(Self::S5e9925),
+            _ => bail!("invalid --soc {value}; use s5e8825 or s5e9925"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self { Self::S5e8825 => "s5e8825", Self::S5e9925 => "s5e9925" }
+    }
+}
+
 #[derive(Debug)]
 pub struct RunOptions {
+    pub soc: Soc,
     pub ap: PathBuf,
     pub cp: PathBuf,
     pub csc: PathBuf,
@@ -51,6 +71,7 @@ pub struct RunOptions {
 
 #[derive(Debug)]
 pub struct SignImageOptions {
+    pub soc: Soc,
     pub source: PathBuf,
     pub name: String,
     pub input: PathBuf,
@@ -61,6 +82,7 @@ pub struct SignImageOptions {
 
 #[derive(Debug)]
 pub struct BuildVbmetaOptions {
+    pub soc: Soc,
     pub source: PathBuf,
     pub images: BTreeMap<String, PathBuf>,
     pub output: PathBuf,
@@ -70,6 +92,7 @@ pub struct BuildVbmetaOptions {
 
 #[derive(Debug)]
 pub struct UpdateApOptions {
+    pub soc: Soc,
     pub base: PathBuf,
     pub bl: Option<PathBuf>,
     pub bl_output: Option<PathBuf>,
@@ -127,8 +150,7 @@ fn derive_stock(cfg_raw: &[u8], cfg: &Config, src: &StockInput, bl: &Path,
 
 pub fn sign_image(o: SignImageOptions) -> Result<PathBuf> {
     let root = project_root(o.root.as_deref())?;
-    let cfg_raw = fs::read(root.join("s5e8825.json"))?;
-    let cfg = Config::load_path(&root.join("s5e8825.json"))?;
+    let (cfg_raw, cfg) = load_config(&root, o.soc)?;
     cfg.validate_image_rules()?;
     let p = Stock::from_archive(&o.source)?.context("archive has no android-resigner.json")?;
     p.require_config(&cfg_raw)?;
@@ -150,8 +172,7 @@ pub fn sign_image(o: SignImageOptions) -> Result<PathBuf> {
 
 pub fn build_vbmeta(o: BuildVbmetaOptions) -> Result<PathBuf> {
     let root = project_root(o.root.as_deref())?;
-    let raw = fs::read(root.join("s5e8825.json"))?;
-    let cfg = Config::load_path(&root.join("s5e8825.json"))?;
+    let (raw, cfg) = load_config(&root, o.soc)?;
     cfg.validate_image_rules()?;
     let p = Stock::from_archive(&o.source)?.context("archive has no android-resigner.json")?;
     p.require_config(&raw)?;
@@ -215,8 +236,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         if path.canonicalize().ok() == o.output.canonicalize().ok() { bail!("AOSP ZIP cannot be the output") }
         if o.bl.is_none() { bail!("update-ap --aosp-zip requires --bl") }
     }
-    let raw = fs::read(root.join("s5e8825.json"))?;
-    let cfg = Config::load_path(&root.join("s5e8825.json"))?;
+    let (raw, cfg) = load_config(&root, o.soc)?;
     cfg.validate_image_rules()?;
     let names = cfg.android.archive.iter().chain(&cfg.android.vbmeta).cloned().collect::<Vec<_>>();
     let mut base = StockInput::single(&o.base, names)?;
@@ -449,10 +469,24 @@ fn restore(path: &Path, copy: Option<&Path>) {
     }
 }
 
+fn config_path(root: &Path, soc: Soc) -> PathBuf {
+    root.join(CONFIG_DIR).join(format!("{}.json", soc.as_str()))
+}
+
+fn load_config(root: &Path, soc: Soc) -> Result<(Vec<u8>, Config)> {
+    let path = config_path(root, soc);
+    let raw = fs::read(&path).with_context(|| format!("missing Android config for {}", soc.as_str()))?;
+    let cfg = Config::load_path(&path)?;
+    if cfg.soc != soc.as_str() { bail!("{} has the wrong SoC", path.display()) }
+    Ok((raw, cfg))
+}
+
 fn project_root(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         let root = path.canonicalize().with_context(|| format!("locating project root {}", path.display()))?;
-        if !root.join("s5e8825.json").is_file() { bail!("{} has no s5e8825.json", root.display()) }
+        if !root.join(CONFIG_DIR).is_dir() || !root.join("signer/keys").is_dir() {
+            bail!("{} is not the project root", root.display())
+        }
         return Ok(root)
     }
 
@@ -462,12 +496,12 @@ fn project_root(explicit: Option<&Path>) -> Result<PathBuf> {
     }
     for start in starts {
         for candidate in start.ancestors() {
-            if candidate.join("s5e8825.json").is_file() && candidate.join("signer/keys").is_dir() {
+            if candidate.join(CONFIG_DIR).is_dir() && candidate.join("signer/keys").is_dir() {
                 return candidate.canonicalize().with_context(|| format!("locating project root {}", candidate.display()))
             }
         }
     }
-    bail!("could not find s5e8825.json and signer/keys; use --root")
+    bail!("could not find the project root; use --root")
 }
 
 fn output_parent(output: &Path) -> &Path {
@@ -482,15 +516,13 @@ fn validate_streaming(config: &Config, input: &StockInput) -> Result<()> {
     if !config.android.archive.contains(&config.android.super_image) { bail!("configured super image is not in the Android archive") }
     let wanted = config.android.archive.iter().chain(&config.android.vbmeta).map(String::as_str).collect::<BTreeSet<_>>();
     let actual = input.names().collect::<BTreeSet<_>>();
-    if wanted != actual { bail!("firmware images do not match s5e8825.json") }
+    if wanted != actual { bail!("firmware images do not match the selected SoC config") }
     Ok(())
 }
 
 pub fn run(options: RunOptions) -> Result<PathBuf> {
     let root = project_root(options.root.as_deref())?;
-    let cfg_path = root.join("s5e8825.json");
-    let cfg_raw = fs::read(&cfg_path)?;
-    let config = Config::load_path(&cfg_path)?;
+    let (cfg_raw, config) = load_config(&root, options.soc)?;
     let bl = options.bl.as_ref().context("--bl BL_RESIGNED is required")?;
     if !bl.is_file() { bail!("BL archive does not exist or is not a file: {}", bl.display()) }
     if let Some(path) = &options.aosp_zip {

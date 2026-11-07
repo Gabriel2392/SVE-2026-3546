@@ -2,17 +2,26 @@
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
-(( $# == 2 )) || { echo "usage: $0 BL PIT" >&2; exit 2; }
+(( $# == 4 )) && [[ "$1" == --soc ]] || {
+    echo "usage: $0 --soc {s5e8825,s5e9925} BL PIT" >&2
+    exit 2
+}
+soc="$2"
+[[ "${soc}" == s5e8825 || "${soc}" == s5e9925 ]] || {
+    echo "invalid SoC: ${soc}" >&2
+    exit 2
+}
 
 root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-bl="$(realpath -- "$1")"
-pit="$(realpath -- "$2")"
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/s5e8825-loader.XXXXXX")"
+bl="$(realpath -- "$3")"
+pit="$(realpath -- "$4")"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/exynos-loader.XXXXXX")"
 trap 'find "${tmp}" -depth -delete' EXIT
 cd -- "${root}"
 
-python3 resolve.py "${bl}"
-python3 loader/bundle.py "${bl}" "${pit}" loader/bundle.bin loader/bundle_expected.h
+python3 resolve.py --soc "${soc}" "${bl}"
+python3 loader/bundle.py --soc "${soc}" \
+    "${bl}" "${pit}" loader/bundle.bin loader/bundle_expected.h
 
 aarch64-linux-gnu-as -o "${tmp}/start.o" loader/start.S
 flags=(
