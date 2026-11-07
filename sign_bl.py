@@ -13,23 +13,20 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "signer"))
 
 import cs
+import patches
 import signer
 from layout import SOCS, Layout
 
 
-OLD_TAG = b"Samsung Official"
-NEW_TAG = b" Rakesh Official"
-
-
-def patch_lk(images: dict[str, bytes], layout: Layout) -> dict[str, bytes]:
+def patch_lk(images: dict[str, bytes], layout: Layout) -> tuple[dict[str, bytes], int | None]:
     image = layout.by_name[layout.lk_image]
     part = next(item for item in image.parts if item.name == layout.lk_part)
     data = bytearray(images[layout.lk_image])
-    raw = bytes(data[part.start:part.end])
-    data[part.start:part.end] = raw.replace(OLD_TAG, NEW_TAG)
+    raw, d2 = patches.patch_lk(bytes(data[part.start:part.end]))
+    data[part.start:part.end] = raw
     out = dict(images)
     out[layout.lk_image] = bytes(data)
-    return out
+    return out, d2
 
 
 def key_path(path: Path | None, layout: Layout) -> Path:
@@ -116,8 +113,9 @@ def main() -> None:
     keys = cs.Keys.load(key_path(a.keys, layout))
     _, ree = cs.stock_keys(stock[layout.key_image], layout.signing_type)
     pit_data = sign_pit(pit.read_bytes(), stock, layout, ree, keys, a.rollback)
-    stock = patch_lk(stock, layout)
+    stock, d2 = patch_lk(stock, layout)
     images, _ = signer.sign_images(stock, layout, keys, a.rollback)
+    patches.check_lk(layout.lk(images), d2)
 
     bl_tmp = temp(bl_out)
     pit_tmp = temp(pit_out)
@@ -125,6 +123,8 @@ def main() -> None:
         signer.write_tar(
             images, layout, bl_tmp, bl_out.name.removesuffix(".md5")
         )
+        check_layout, check_images = signer.load_stock(bl_tmp, a.soc)
+        patches.check_lk(check_layout.lk(check_images), d2)
         pit_tmp.write_bytes(pit_data)
         os.replace(bl_tmp, bl_out)
         os.replace(pit_tmp, pit_out)
@@ -132,6 +132,7 @@ def main() -> None:
         bl_tmp.unlink(missing_ok=True)
         pit_tmp.unlink(missing_ok=True)
 
+    print("D2: absent" if d2 is None else f"D2: LK+{d2:#x}")
     print(f"{layout.soc}: {bl_out}")
     print(pit_out)
 
