@@ -286,16 +286,15 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         stock.set_bl_source(bl_hash)?;
     }
     let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
-    if let Some(aosp) = &aosp { aosp.validate_target(stock.firmware())?; }
     let aosp_catalog = if aosp.is_some() {
         Some(Catalog::open(o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?)?)
     } else { None };
     let keys = Keys::load(&root, &cfg.signing)?;
     let mut physical = inputs(o.images, &cfg.android.image_rules)?;
     if let Some(aosp) = &aosp {
-        for name in ["boot.img", "vendor_boot.img", "dtbo.img", "recovery.img", "modem.bin"] {
+        for name in cfg.android.archive.iter().filter(|name| *name != &cfg.android.super_image) {
             if !physical.contains_key(name) {
-                if let Some(image) = aosp.physical(name, stock.firmware())? { physical.insert(name.into(), image); }
+                if let Some(image) = aosp.physical(name)? { physical.insert(name.clone(), image); }
             }
         }
     }
@@ -591,7 +590,6 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     stock.require_config(&cfg_raw)?;
     if stock.soc() != config.soc { bail!("saved signing data uses a different SoC") }
     let aosp = options.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
-    if let Some(aosp) = &aosp { aosp.validate_target(stock.firmware())?; }
     let aosp_catalog = if aosp.is_some() { Some(Catalog::open(bl)?) } else { None };
     if aosp.is_some() && options.super_image.is_some() { bail!("--super cannot be combined with --aosp-zip") }
     let mut paths = options.images;
@@ -603,9 +601,9 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     }
     let mut physical = inputs(paths, &config.android.image_rules)?;
     if let Some(aosp) = &aosp {
-        for name in ["boot.img", "vendor_boot.img", "dtbo.img", "recovery.img", "modem.bin"] {
+        for name in config.android.archive.iter().filter(|name| *name != &config.android.super_image) {
             if !physical.contains_key(name) {
-                if let Some(image) = aosp.physical(name, stock.firmware())? { physical.insert(name.into(), image); }
+                if let Some(image) = aosp.physical(name)? { physical.insert(name.clone(), image); }
             }
         }
     }
