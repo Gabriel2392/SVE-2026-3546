@@ -285,7 +285,11 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         stock.replace_images(records)?;
         stock.set_bl_source(bl_hash)?;
     }
-    let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
+    let scratch = output_parent(&o.output);
+    if o.aosp_zip.is_some() {
+        fs::create_dir_all(scratch).with_context(|| format!("creating output directory {}", scratch.display()))?;
+    }
+    let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path, scratch)).transpose()?;
     let aosp_catalog = if aosp.is_some() {
         Some(Catalog::open(o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?)?)
     } else { None };
@@ -589,7 +593,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     let mut stock = derive_stock(&cfg_raw, &config, &input, bl, hashes, true)?;
     stock.require_config(&cfg_raw)?;
     if stock.soc() != config.soc { bail!("saved signing data uses a different SoC") }
-    let aosp = options.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
+    let aosp = options.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path, parent)).transpose()?;
     let aosp_catalog = if aosp.is_some() { Some(Catalog::open(bl)?) } else { None };
     if aosp.is_some() && options.super_image.is_some() { bail!("--super cannot be combined with --aosp-zip") }
     let mut paths = options.images;

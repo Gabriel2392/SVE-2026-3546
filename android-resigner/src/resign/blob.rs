@@ -5,6 +5,7 @@ use crate::io::{Bytes, ReadAt, Region};
 pub type Blob = Arc<dyn ReadAt>;
 
 pub fn file(path: &Path) -> io::Result<Blob> { Ok(Arc::new(File::open(path)?)) }
+pub fn file_handle(file: File) -> Blob { Arc::new(file) }
 pub fn bytes(data: Vec<u8>) -> Blob { Arc::new(Bytes(data)) }
 pub fn region(source: Blob, start: u64, len: u64) -> io::Result<Blob> { Ok(Arc::new(Region::new(source, start, len)?)) }
 

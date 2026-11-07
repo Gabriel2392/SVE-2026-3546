@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::Read,
+    io::{BufWriter, Read, Write},
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -16,8 +16,9 @@ const BLOCK: u64 = 4096;
 const MAX_SMALL: u64 = 64 << 20;
 const MAX_LIST: u64 = 8 << 20;
 const MAX_DIRECT: u64 = 512 << 20;
-const MAX_IMAGE: u64 = 4 << 30;
-const MAX_TOTAL_NEW: u64 = 4 << 30;
+const MEMORY_LIMIT: u64 = 4 << 30;
+const MAX_IMAGE: u64 = 16 << 30;
+const MAX_TOTAL_NEW: u64 = 16 << 30;
 const RANGE_LIMIT: usize = 262_144;
 
 #[derive(Clone, Debug)]
@@ -41,6 +42,8 @@ pub(super) struct AospZip {
     zip: Zip,
     layout: DynamicLayout,
     lists: BTreeMap<String, TransferList>,
+    disk: BTreeSet<String>,
+    scratch: PathBuf,
 }
 
 #[derive(Clone)]
@@ -163,20 +166,28 @@ fn dynamic(data: &[u8]) -> Result<DynamicLayout> {
 }
 
 impl AospZip {
-    pub(super) fn open(path: &Path) -> Result<Self> {
+    pub(super) fn open(path: &Path, scratch: &Path) -> Result<Self> {
         let source: Arc<dyn ReadAt> = Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
         let zip = Zip::open(source).with_context(|| format!("reading {}", path.display()))?;
         let info = metadata(&Self::read_entry(&zip, "META-INF/com/android/metadata", MAX_SMALL)?)?;
         if info.get("ota-type").map(String::as_str) != Some("BLOCK") { bail!("AOSP ZIP is not a BLOCK OTA") }
         let layout = dynamic(&Self::read_entry(&zip, "dynamic_partitions_op_list", MAX_SMALL)?)?;
         let mut lists = BTreeMap::new();
+        let mut disk = BTreeSet::new();
+        let mut memory = 0u64;
         let mut total_new = 0u64;
         for name in layout.partitions.keys() {
             let raw = Self::read_entry(&zip, &format!("{name}.transfer.list"), MAX_LIST)?;
             let list = transfer(std::str::from_utf8(&raw).context("transfer list is not UTF-8")?)?;
             let bytes = list.new_blocks.checked_mul(BLOCK).context("AOSP new-data size overflow")?;
             if bytes > layout.partitions[name].size { bail!("AOSP new-data exceeds partition {name}") }
-            total_new = total_new.checked_add(bytes).filter(|size| *size <= MAX_TOTAL_NEW).context("AOSP ZIP requires too much memory")?;
+            total_new = total_new.checked_add(bytes).filter(|size| *size <= MAX_TOTAL_NEW).context("AOSP ZIP has too much new-data")?;
+            if bytes > MEMORY_LIMIT || bytes > usize::MAX as u64
+                || memory.checked_add(bytes).is_none_or(|size| size > MEMORY_LIMIT) {
+                disk.insert(name.clone());
+            } else {
+                memory += bytes;
+            }
             let data = zip.exact(&format!("{name}.new.dat.br"))?;
             if data.method != 0 || data.size == 0 || data.size > MAX_IMAGE { bail!("invalid AOSP new-data member for {name}") }
             zip.verify(data).with_context(|| format!("checking AOSP new-data for {name}"))?;
@@ -187,7 +198,7 @@ impl AospZip {
         }
         let empty = zip.exact("unsparse_super_empty.img")?;
         if empty.size < 4 || empty.size > MAX_SMALL { bail!("invalid unsparse_super_empty.img size") }
-        Ok(Self { zip, layout, lists })
+        Ok(Self { zip, layout, lists, disk, scratch: scratch.to_owned() })
     }
 
     fn read_entry(zip: &Zip, name: &str, limit: u64) -> Result<Vec<u8>> {
@@ -221,15 +232,26 @@ impl AospZip {
         let Some(partition) = self.layout.partitions.get(name) else { return Ok(None) };
         let list = self.lists.get(name).context("AOSP transfer list disappeared")?.clone();
         let expected = list.new_blocks.checked_mul(BLOCK).context("AOSP new-data size overflow")?;
-        if expected > partition.size || expected > MAX_IMAGE || expected > usize::MAX as u64 { bail!("invalid AOSP new-data size for {name}") }
+        if expected > partition.size || expected > MAX_IMAGE { bail!("invalid AOSP new-data size for {name}") }
         let entry = self.zip.exact(&format!("{name}.new.dat.br"))?;
         let reader = self.zip.reader(entry)?;
         let mut decoder = brotli::Decompressor::new(reader, 64 << 10).take(expected + 1);
-        let mut decoded = Vec::new();
-        decoded.try_reserve_exact(expected as usize).context("AOSP new-data allocation failed")?;
-        decoder.read_to_end(&mut decoded)?;
-        if decoded.len() as u64 != expected { bail!("AOSP new-data size mismatch for {name}") }
-        let source = blob::bytes(decoded);
+        let source = if self.disk.contains(name) {
+            let file = tempfile::tempfile_in(&self.scratch).context("creating AOSP scratch file")?;
+            let mut output = BufWriter::with_capacity(1 << 20, file);
+            let size = std::io::copy(&mut decoder, &mut output).with_context(|| format!("writing AOSP new-data for {name}"))?;
+            output.flush().with_context(|| format!("flushing AOSP new-data for {name}"))?;
+            let file = output.into_inner().map_err(|error| error.into_error())?;
+            if size != expected || file.metadata()?.len() != expected { bail!("AOSP new-data size mismatch for {name}") }
+            blob::file_handle(file)
+        } else {
+            if expected > usize::MAX as u64 { bail!("AOSP new-data is too large for memory") }
+            let mut decoded = Vec::new();
+            decoded.try_reserve_exact(expected as usize).context("AOSP new-data allocation failed")?;
+            decoder.read_to_end(&mut decoded)?;
+            if decoded.len() as u64 != expected { bail!("AOSP new-data size mismatch for {name}") }
+            blob::bytes(decoded)
+        };
         let mut at = 0u64;
         let mut used = Vec::new();
         let mut changes = Vec::new();
