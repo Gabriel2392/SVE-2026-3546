@@ -23,7 +23,7 @@ impl AvbGenerationPolicy {
 
     fn salt(&self, stock: &Stock, partition: &str) -> Result<[u8; 32]> {
         match &self.salt {
-            SaltPolicy::StockDerived => Ok(stock.generated_salt(partition)),
+            SaltPolicy::Stock => Ok(stock.generated_salt(partition)),
             SaltPolicy::Zero => Ok([0; 32]),
             SaltPolicy::Fixed { hex } => {
                 let raw = hex::decode(hex).context("invalid fixed AVB salt")?;

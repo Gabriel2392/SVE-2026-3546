@@ -38,9 +38,10 @@ impl Catalog {
             members.push((entry.name.clone(), decode(&index, entry).with_context(|| format!("decoding BL member {}", entry.name))?));
         }
         if members.is_empty() { bail!("BL archive contains no regular files") }
-        let keys = members.iter().filter_map(|(_, data)| crypto::sbl1_public_keys(data).ok()).collect::<Vec<_>>();
-        if keys.len() != 1 { bail!("BL archive does not contain one valid SBL1 key source") }
-        Self::from_decoded(members, Some(&keys[0]))
+        let fld = members.iter().filter(|(name, _)| matches!(name.rsplit('/').next(), Some("fld.bin" | "fld.bin.lz4"))).collect::<Vec<_>>();
+        if fld.len() != 1 { bail!("BL archive does not contain one FLD image") }
+        let keys = crypto::sbl1_public_keys(&fld[0].1).context("FLD has no valid SBL1 keys")?;
+        Self::from_decoded(members, Some(&keys))
     }
 
     fn from_decoded(members: impl IntoIterator<Item = (String, Vec<u8>)>, keys: Option<&[p384::ecdsa::VerifyingKey; 2]>) -> Result<Self> {

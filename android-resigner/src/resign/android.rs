@@ -18,6 +18,11 @@ struct Input { metadata_bytes: Vec<u8>, metadata: lp::Metadata, raw: Blob }
 
 fn mode(key: u32) -> &'static str { if key == 0 { "TEE" } else { "REE" } }
 
+fn firmware(base: &str, alternate: Option<&str>, candidate: &str) -> bool {
+    codesigner::same_build_family(base, candidate)
+        || alternate.is_some_and(|value| codesigner::same_build_family(value, candidate))
+}
+
 fn data_size(descriptor: &avb::Descriptor) -> Result<u64> {
     if let Some(value) = descriptor.hash()? { return Ok(value.image_size) }
     if let Some(value) = descriptor.tree()? { return Ok(value.image_size) }
@@ -118,7 +123,8 @@ pub(super) fn update_super(config: &Config, source: &dyn ImageSource, stock: &St
         || record.capacity() != input.metadata.device_size() { bail!("super stock geometry mismatch") }
     let mut seed = vec![0; 4096]; prefix.read_exact_at(0, &mut seed)?;
     let mut template = codesigner::Template::from_sparse_seed(&seed)?;
-    if !codesigner::same_build_family(stock.firmware(), &template.firmware_version()?)
+    let alternate = record.codesigner().map(|value| value.firmware());
+    if !firmware(stock.firmware(), alternate, &template.firmware_version()?)
         || template.rollback()? != stock.rollback() { bail!("super CodeSigner identity differs from stock") }
     template = match config.android.image_rules[&config.android.super_image].key {
         KeyPolicy::Auto => template, KeyPolicy::Tee => template.with_key_type(0)?, KeyPolicy::Ree => template.with_key_type(1)?,
@@ -216,7 +222,7 @@ fn super_image(config: &Config, source: &dyn ImageSource, keys: &Keys, catalog: 
     }
     let template = codesigner::Template::from_sparse_seed(&signer)?;
     let signer_id = template.firmware_version()?;
-    if !codesigner::same_build_family(build_id, &signer_id) {
+    if !firmware(build_id, catalog.map(Catalog::version), &signer_id) {
         bail!("{} build ID mismatch: {signer_id} is not in {build_id}", config.android.super_image)
     }
     let super_image = codesigner::sign_sparse(sparse, &signer, &config.android.super_image, keys)?;
@@ -224,13 +230,16 @@ fn super_image(config: &Config, source: &dyn ImageSource, keys: &Keys, catalog: 
     Ok(SuperBuilt { image: super_image, descriptors })
 }
 
-fn physical(source: &dyn ImageSource, name: &str, rule: &ImageRule, keys: &Keys, build_id: &str) -> Result<(Blob, Option<avb::Descriptor>)> {
+fn physical(source: &dyn ImageSource, name: &str, rule: &ImageRule, keys: &Keys,
+            catalog: Option<&Catalog>, build_id: &str) -> Result<(Blob, Option<avb::Descriptor>)> {
     let stock = source.image(name)?;
     if rule.codesigner == CodeSignerKind::Sparse {
         let raw = sparse::decode_if_sparse(stock).with_context(|| format!("reading raw/sparse {name}"))?;
         let signer = codesigner::sparse_template(&raw).with_context(|| format!("reading sparse CodeSigner data from {name}"))?;
         let signer_id = codesigner::Template::from_sparse_seed(&signer)?.firmware_version()?;
-        if !codesigner::same_build_family(build_id, &signer_id) { bail!("{name} build ID mismatch: {signer_id} is not in {build_id}") }
+        if !firmware(build_id, catalog.map(Catalog::version), &signer_id) {
+            bail!("{name} build ID mismatch: {signer_id} is not in the AP/BL family")
+        }
         let (raw, descriptor) = if matches!(rule.avb, AvbKind::Hash | AvbKind::Hashtree) {
             let parsed = avb::parse(raw.clone())?;
             let (raw, descriptor) = avb::resign_metadata(&parsed, keys)?;
@@ -247,7 +256,12 @@ fn physical(source: &dyn ImageSource, name: &str, rule: &ImageRule, keys: &Keys,
     if template.as_ref().is_some_and(|item| item.footer.is_none()) { bail!("required AVB footer is missing from {name}") }
     let code = codesigner::extract(&stock, boundary)?; let payload_size = boundary.checked_sub(codesigner::NORMAL as u64).context("CodeSigner boundary underflow")?;
     let image_id = code.firmware_version()?;
-    if !codesigner::same_build_family(build_id, &image_id) { bail!("{name} build ID mismatch: {image_id} is not in {build_id}") }
+    let valid = if rule.partition == "modem" { codesigner::same_model(build_id, &image_id) }
+        else { firmware(build_id, catalog.map(Catalog::version), &image_id) };
+    if !valid {
+        if rule.partition == "modem" { bail!("{name} model mismatch: {image_id} is not for {build_id}") }
+        bail!("{name} build ID mismatch: {image_id} is not in the AP/BL family")
+    }
     let mut payload = blob::region(stock, 0, payload_size)?;
     if let Some(ramdisk) = &rule.ramdisk {
         eprintln!("Processing {name} for firmware files");
@@ -264,7 +278,9 @@ fn vbmeta(input: &dyn ImageSource, name: &str, replacements: &BTreeMap<String, a
     let source = if main { catalog.and_then(Catalog::vbmeta).unwrap_or(input.image(name)?) } else { input.image(name)? };
     let size = source.len()?; let code = codesigner::extract(&source, size)?;
     let image_id = code.firmware_version()?;
-    if !codesigner::same_build_family(build_id, &image_id) { bail!("{name} build ID mismatch: {image_id} is not in {build_id}") }
+    if !firmware(build_id, catalog.map(Catalog::version), &image_id) {
+        bail!("{name} build ID mismatch: {image_id} is not in the AP/BL family")
+    }
     let parsed = avb::parse(source)?;
     let encoded = avb::standalone(&parsed, replacements, targets, managed, keys)?;
     let image = codesigner::append_vbmeta(encoded, &code, name, keys)?;
@@ -278,7 +294,7 @@ pub(super) fn build(config: &Config, input: &dyn ImageSource, keys: &Keys, bl: O
     let main_source = input.image(main_vbmeta)?;
     let build_id = codesigner::extract(&main_source, main_source.len()?)?.firmware_version()?;
     if let Some(catalog) = &catalog {
-        if build_id != catalog.version() {
+        if !codesigner::same_model(&build_id, catalog.version()) {
             bail!("BL/AP firmware mismatch: BL {}, AP {build_id}", catalog.version())
         }
     }
@@ -286,7 +302,8 @@ pub(super) fn build(config: &Config, input: &dyn ImageSource, keys: &Keys, bl: O
     images.insert(config.android.super_image.clone(), built_super.image);
     for name in config.android.archive.iter().filter(|name| *name != &config.android.super_image) {
         let rule = config.android.image_rules.get(name).with_context(|| format!("missing image rule for {name}"))?;
-        let (image, descriptor) = physical(input, name, rule, keys, &build_id).with_context(|| format!("processing physical image {name}"))?;
+        let (image, descriptor) = physical(input, name, rule, keys, catalog.as_ref(), &build_id)
+            .with_context(|| format!("processing physical image {name}"))?;
         if let Some(descriptor) = descriptor { let partition = descriptor.name()?.context("physical AVB descriptor has no partition name")?; if descriptors.insert(partition.clone(), descriptor).is_some() { bail!("duplicate signed descriptor {partition}") } }
         images.insert(name.clone(), image);
     }

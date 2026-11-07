@@ -144,6 +144,8 @@ impl CodeSignerRecord {
         }
         Ok(())
     }
+
+    pub(super) fn firmware(&self) -> &str { &self.firmware }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -305,13 +307,19 @@ impl Stock {
         Ok(())
     }
 
-    pub(super) fn replace_image(&mut self, name: &str, record: ImageRecord) -> Result<()> {
-        let old = self.data.images.remove(name).with_context(|| format!("stock data has no image named {name}"))?;
-        self.data.images.insert(name.to_owned(), record);
-        if let Err(error) = self.validate(false) {
-            self.data.images.insert(name.to_owned(), old);
-            return Err(error)
+    pub(super) fn replace_images(&mut self, records: BTreeMap<String, ImageRecord>) -> Result<()> {
+        if let Some(name) = records.keys().find(|name| !self.data.images.contains_key(*name)) {
+            bail!("stock data has no image named {name}")
         }
+        let old = self.data.images.clone(); self.data.images.extend(records);
+        if let Err(error) = self.validate(false) { self.data.images = old; return Err(error) }
+        Ok(())
+    }
+
+    pub(super) fn set_bl_source(&mut self, value: String) -> Result<()> {
+        if !valid_digest(&value) { bail!("invalid BL source SHA-256") }
+        let old = std::mem::replace(&mut self.data.sources.bl, value);
+        if let Err(error) = self.validate(false) { self.data.sources.bl = old; return Err(error) }
         Ok(())
     }
 
@@ -376,7 +384,7 @@ impl Stock {
         self.data.sources.validate()?;
         let count = self.data.images.len().checked_add(self.data.logical.len()).context("stock record count overflow")?;
         if count > MAX_RECORDS || (require_images && self.data.images.is_empty()) { bail!("invalid stock record count") }
-        let mut names = BTreeSet::new();
+        let mut names = BTreeSet::new(); let mut signer = None;
         for (logical, records) in [(false, &self.data.images), (true, &self.data.logical)] {
             for (name, record) in records {
                 if !safe_name(name) || !safe_name(&record.partition) || !names.insert(name) { bail!("invalid or duplicate stock record {name:?}") }
@@ -384,9 +392,13 @@ impl Stock {
                 if logical && record.codesigner.is_some() { bail!("logical stock record {name} unexpectedly has CodeSigner metadata") }
                 if let Some(code) = &record.codesigner {
                     code.material()?;
-                    if !codesigner::same_build_family(&self.data.firmware, &code.firmware) || code.rollback != self.data.rollback {
+                    if !codesigner::same_model(&self.data.firmware, &code.firmware) || code.rollback != self.data.rollback {
                         bail!("{name}: CodeSigner data is from another firmware version")
                     }
+                    if signer.is_some_and(|firmware| !codesigner::same_build_family(firmware, &code.firmware)) {
+                        bail!("CodeSigner records contain mixed firmware versions")
+                    }
+                    signer.get_or_insert(code.firmware.as_str());
                 }
                 if let Some(template) = &record.avb_template {
                     let parsed = template.parsed()?;

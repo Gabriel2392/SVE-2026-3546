@@ -207,19 +207,22 @@ impl StockInput {
         let mut images = BTreeMap::new(); let mut transport = BTreeMap::new(); let mut metadata = BTreeMap::new();
         for name in names {
             if name.is_empty() || name.contains(['/', '\\']) { bail!("unsafe configured image name {name:?}") }
-            let packed = format!("{name}.lz4"); let mut found: Option<(&TarIndex, &IndexedTarEntry)> = None;
+            let packed = format!("{name}.lz4"); let mut found: Option<(&TarIndex, &IndexedTarEntry, bool)> = None;
             for index in &archives {
-                for entry in index.entries().iter().filter(|entry| entry.name.rsplit('/').next() == Some(packed.as_str())) {
+                for entry in index.entries().iter().filter(|entry| matches!(entry.kind, 0 | b'0')) {
+                    let member = entry.name.rsplit('/').next();
+                    let lz4 = member == Some(packed.as_str());
+                    if !lz4 && member != Some(name.as_str()) { continue }
                     if found.is_some() { bail!("configured image {name} is ambiguous across firmware archives") }
-                    found = Some((index, entry));
+                    found = Some((index, entry, lz4));
                 }
             }
-            let (index, entry) = found.with_context(|| format!("firmware archives are missing {packed}"))?;
-            let frame = FrameBlob::open(index.region(entry)?)?;
-            let raw = sparse::decode_if_sparse(frame.clone()).with_context(|| format!("decoding {packed}"))?;
+            let (index, entry, lz4) = found.with_context(|| format!("firmware archives are missing {name}"))?;
+            let source: Blob = if lz4 { FrameBlob::open(index.region(entry)?)? } else { Arc::new(index.region(entry)?) };
+            let raw = sparse::decode_if_sparse(source.clone()).with_context(|| format!("decoding {name}"))?;
             let meta = index.metadata(entry)?;
             metadata.insert(name.clone(), Meta { mode: meta.mode & 0o7777, mtime: meta.mtime });
-            transport.insert(name.clone(), frame); images.insert(name, raw);
+            transport.insert(name.clone(), source); images.insert(name, raw);
         }
         Ok(Self { images, transport, metadata })
     }

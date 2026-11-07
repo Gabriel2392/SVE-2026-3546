@@ -83,7 +83,7 @@ pub struct AvbGenerationPolicy {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SaltPolicy {
-    StockDerived,
+    Stock,
     Zero,
     Fixed { hex: String },
 }

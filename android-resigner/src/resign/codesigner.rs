@@ -28,6 +28,18 @@ pub(super) fn same_build_family(base: &str, candidate: &str) -> bool {
     })
 }
 
+pub(super) fn same_model(base: &str, candidate: &str) -> bool {
+    fn model(value: &str) -> Option<&str> {
+        if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') { return None }
+        let value = value.split('_').next()?;
+        let at = value.len().checked_sub(8)?;
+        let (model, build) = value.split_at(at);
+        (!model.is_empty() && model.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            && build.len() == 8 && build.bytes().all(|byte| byte.is_ascii_alphanumeric())).then_some(model)
+    }
+    model(base).zip(model(candidate)).is_some_and(|(base, candidate)| base == candidate)
+}
+
 impl Template {
     pub(super) fn key_type(&self) -> Result<u32> {
         let value = le32(&self.footer, 8)?;

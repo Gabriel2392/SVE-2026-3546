@@ -106,7 +106,7 @@
       "footer_version_major": 1,
       "footer_version_minor": 0,
       "release": "android-resigner",
-      "salt": {"mode": "stock-derived"}
+      "salt": {"mode": "stock"}
     },
     "logical_rules": {
       "system.img": {

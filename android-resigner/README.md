@@ -6,6 +6,8 @@
 cargo build --release --manifest-path android-resigner/Cargo.toml
 ```
 
+Use `--soc s5e8825` or `--soc s5e9925`.
+
 ## Full firmware
 
 ```sh

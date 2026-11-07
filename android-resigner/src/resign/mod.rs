@@ -30,7 +30,7 @@ use archive::TarMd5;
 use config::Config;
 use crypto::Keys;
 use input::StockInput;
-use stock::{CodeSignerRecord, ImageRecord, Stock, SourceHashes, sha256_bytes};
+use stock::{CodeSignerRecord, ImageRecord, Stock, SourceHashes, sha256_bytes, sha256_file};
 use templates::Catalog;
 
 const CONFIG_DIR: &str = "android-resigner/config";
@@ -113,7 +113,7 @@ fn derive_stock(cfg_raw: &[u8], cfg: &Config, src: &StockInput, bl: &Path,
     let fw = code.firmware_version()?;
     let rb = code.rollback()?;
     let cat = Catalog::open(bl)?;
-    if fw != cat.version() || rb != cat.normal(cfg.android.st2_key_type)?.rollback()? { bail!("BL and AP firmware do not match") }
+    if !codesigner::same_model(&fw, cat.version()) || rb != cat.normal(cfg.android.st2_key_type)?.rollback()? { bail!("BL and AP firmware do not match") }
     let mut stock = Stock::new(&cfg.soc, &fw, rb, sha256_bytes(cfg_raw), hashes)?;
     for (name, rule) in &cfg.android.image_rules {
         let source = if name == main { cat.vbmeta().context("BL archive has no vbmeta.img")? } else { src.image(name)? };
@@ -249,20 +249,44 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     };
     stock.require_config(&raw)?;
     if stock.soc() != cfg.soc { bail!("saved signing data uses a different SoC") }
+    let bl_update = o.bl.is_some();
+    let mut refresh = false;
     if let Some(bl) = &o.bl {
+        let bl_hash = sha256_file(bl)?;
         let cat = Catalog::open(bl)?;
-        if cat.version() != stock.firmware() || cat.normal(cfg.android.st2_key_type)?.rollback()? != stock.rollback() {
+        if !codesigner::same_model(cat.version(), stock.firmware()) || cat.normal(cfg.android.st2_key_type)?.rollback()? != stock.rollback() {
             bail!("BL and AP firmware do not match")
         }
         let main = cfg.android.vbmeta.last().context("vbmeta.img is not configured")?;
-        let rule = cfg.android.image_rules.get(main).context("vbmeta.img has no image rule")?;
-        let source = cat.vbmeta().context("BL archive has no vbmeta.img")?;
-        let record = independent::record_from_stock(main, source, rule, None)?;
-        stock.replace_image(main, record)?;
+        let current = stock.image(main)?.codesigner().context("vbmeta.img has no CodeSigner data")?.firmware();
+        refresh = !codesigner::same_build_family(current, stock.firmware())
+            && !codesigner::same_build_family(current, cat.version());
+        let mut records = BTreeMap::new();
+        for (name, rule) in &cfg.android.image_rules {
+            let mut record = if name == main {
+                independent::record_from_stock(name, cat.vbmeta().context("BL archive has no vbmeta.img")?, rule, None)?
+            } else { stock.image(name)?.clone() };
+            let key = match rule.key {
+                config::KeyPolicy::Auto => cfg.android.st2_key_type,
+                config::KeyPolicy::Tee => 0,
+                config::KeyPolicy::Ree => 1,
+            };
+            record = match rule.codesigner {
+                config::CodeSignerKind::Normal | config::CodeSignerKind::StandaloneVbmeta => {
+                    record.with_codesigner(CodeSignerRecord::normal(cat.normal(key)?)?)
+                }
+                config::CodeSignerKind::Sparse => {
+                    record.with_codesigner(CodeSignerRecord::sparse(&cat.sparse_seed(key, 4096)?)?)
+                }
+                config::CodeSignerKind::None => record,
+            };
+            records.insert(name.clone(), record);
+        }
+        stock.replace_images(records)?;
+        stock.set_bl_source(bl_hash)?;
     }
     let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
-    if aosp.as_ref().is_some_and(|aosp| aosp.metadata("pre-device") != Some("a53x")) { bail!("AOSP ZIP is not for a53x") }
-    if let Some(aosp) = &aosp { aosp.validate_firmware(stock.firmware())?; }
+    if let Some(aosp) = &aosp { aosp.validate_target(stock.firmware())?; }
     let aosp_catalog = if aosp.is_some() {
         Some(Catalog::open(o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?)?)
     } else { None };
@@ -298,7 +322,6 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
             if !absent.is_empty() { bail!("AOSP vendor_boot fstab references absent logical partitions: {absent:?}") }
         }
     }
-    if physical.is_empty() && logical.is_empty() { bail!("update-ap requires at least one replacement") }
     let super_name = &cfg.android.super_image;
     if !logical.is_empty() && physical.contains_key(super_name) { bail!("super and logical replacements cannot be combined") }
     for name in physical.keys() {
@@ -306,10 +329,21 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
             bail!("standalone vbmeta is regenerated and cannot be supplied: {name}")
         }
     }
+    let mut wrappers = BTreeSet::new();
+    if refresh {
+        for (name, rule) in &cfg.android.image_rules {
+            if matches!(rule.codesigner, config::CodeSignerKind::None | config::CodeSignerKind::StandaloneVbmeta)
+                || rule.partition == "modem" || aosp.is_some() && name == super_name || physical.contains_key(name) { continue }
+            physical.insert(name.clone(), base.transport(name)?); wrappers.insert(name.clone());
+        }
+    }
+    if physical.is_empty() && logical.is_empty() && !bl_update { bail!("update-ap requires at least one replacement") }
     let mut signed_physical = BTreeMap::new();
     for (name, image) in physical {
         let rule = &cfg.android.image_rules[&name];
-        let built = independent::sign(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)?;
+        let built = if wrappers.contains(&name) {
+            independent::wrap(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)?
+        } else { independent::sign(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)? };
         if let Some(key) = built.metadata.code_key {
             eprintln!("CodeSigned {name} ({})", if key == 0 { "TEE" } else { "REE" });
         }
@@ -557,8 +591,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     stock.require_config(&cfg_raw)?;
     if stock.soc() != config.soc { bail!("saved signing data uses a different SoC") }
     let aosp = options.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path)).transpose()?;
-    if aosp.as_ref().is_some_and(|aosp| aosp.metadata("pre-device") != Some("a53x")) { bail!("AOSP ZIP is not for a53x") }
-    if let Some(aosp) = &aosp { aosp.validate_firmware(stock.firmware())?; }
+    if let Some(aosp) = &aosp { aosp.validate_target(stock.firmware())?; }
     let aosp_catalog = if aosp.is_some() { Some(Catalog::open(bl)?) } else { None };
     if aosp.is_some() && options.super_image.is_some() { bail!("--super cannot be combined with --aosp-zip") }
     let mut paths = options.images;
