@@ -107,6 +107,13 @@ pub struct ImageRule {
     pub optional: bool,
 }
 
+impl ImageRule {
+    pub(super) fn signs_firmware(&self) -> bool {
+        self.ramdisk.as_ref().is_some_and(|rule| rule.discover_firmware || !rule.firmware.is_empty())
+            || self.filesystem.as_ref().is_some_and(|rule| rule.discover_firmware || !rule.sign_firmware.is_empty())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Ramdisk {

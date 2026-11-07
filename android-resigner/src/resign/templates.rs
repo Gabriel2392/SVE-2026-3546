@@ -1,6 +1,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, fs::File, io::Read, path::Path, sync::Arc};
 
 use anyhow::{bail, Context, Result};
+use p384::{EncodedPoint, ecdsa::VerifyingKey};
 use sha2_10::{Digest, Sha512};
 
 use crate::{archive::TarIndex, io::ReadAt};
@@ -10,12 +11,70 @@ const LZ4_MAGIC: [u8; 4] = 0x184d_2204u32.to_le_bytes();
 const MAX_MEMBER: u64 = 128 << 20;
 const MARKER: &[u8] = b"SignerVer03";
 const TRAILER: usize = 0x310;
+const SLSI: &[u8] = b"SLSI";
+const P384: usize = 524;
 
 #[derive(Clone)]
 pub(super) struct Catalog {
     version: String,
     templates: BTreeMap<u32, Template>,
     vbmeta: Option<Vec<u8>>,
+    firmware_key: Option<Vec<u8>>,
+}
+
+struct Keystorage { firmware_key: Option<Vec<u8>> }
+
+fn le32(data: &[u8], at: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(data.get(at..at + 4).context("truncated keystorage field")?.try_into().unwrap()))
+}
+
+fn keystorage(data: &[u8]) -> Result<Option<Keystorage>> {
+    if data.get(..4) != Some(SLSI) { return Ok(None) }
+    let version = le32(data, 4)?;
+    if !matches!(version, 0x40 | 0x50) { return Ok(None) }
+    let header = le32(data, 8)? as usize;
+    let count = le32(data, 12)? as usize;
+    let body = le32(data, 0x20)? as usize;
+    let record = if version == 0x50 { 2592 } else { 1056 };
+    let meta = 48 + if version == 0x50 { 24 * 16 } else { 12 * 16 };
+    let meta_len = 24;
+    let slots = header.checked_sub(meta).filter(|value| value % meta_len == 0)
+        .map(|value| value / meta_len).context("invalid keystorage metadata")?;
+    header.checked_add(body).filter(|&end| end <= data.len()).context("invalid keystorage body")?;
+    if count == 0 || count > slots || body != count.checked_mul(record).context("keystorage size overflow")? {
+        bail!("invalid keystorage table")
+    }
+    let mut names = BTreeSet::new();
+    let mut indexes = BTreeSet::new();
+    let mut found = None;
+    for slot in 0..count {
+        let item = meta + slot * meta_len;
+        let raw = data.get(item..item + 16).context("truncated keystorage metadata")?;
+        let name_end = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+        if raw[name_end..].iter().any(|&byte| byte != 0) { bail!("invalid keystorage key name") }
+        let name = std::str::from_utf8(&raw[..name_end]).context("keystorage key name is not UTF-8")?;
+        let index = le32(data, item + 16)?;
+        if name.is_empty() || index == 0 || !names.insert(name) || !indexes.insert(index) {
+            bail!("duplicate keystorage key")
+        }
+        if name != "fw_key" { continue }
+        if found.is_some() || le32(data, item + 20)? != 4 { bail!("invalid keystorage fw_key") }
+        let at = header + slot * record;
+        let key = data.get(at..at + P384).context("truncated keystorage fw_key")?;
+        if data.get(at + P384..at + record).context("truncated keystorage record")?.iter().any(|&byte| byte != 0)
+            || crc32fast::hash(key) != index || key[..20].iter().any(|&byte| byte != 0)
+            || key[68..88].iter().any(|&byte| byte != 0) || key[136..].iter().any(|&byte| byte != 0) {
+            bail!("invalid keystorage fw_key")
+        }
+        let mut point = [0; 97];
+        point[0] = 4;
+        point[1..49].copy_from_slice(&key[20..68]);
+        point[49..].copy_from_slice(&key[88..136]);
+        VerifyingKey::from_encoded_point(&EncodedPoint::from_bytes(point)?)
+            .context("keystorage fw_key is not P-384")?;
+        found = Some(key.to_vec());
+    }
+    Ok(Some(Keystorage { firmware_key: found }))
 }
 
 fn decode(index: &TarIndex, entry: &crate::archive::IndexedTarEntry) -> Result<Vec<u8>> {
@@ -48,9 +107,16 @@ impl Catalog {
         let members = members.into_iter().collect::<Vec<_>>();
         let mut metadata = Vec::<(u8, String, usize, Template)>::new();
         let mut vbmeta = None;
+        let mut firmware_key = None;
+        let mut has_keystorage = false;
         let mut leaves = BTreeMap::new();
         let mut standalone = BTreeSet::new();
         for (name, data) in &members {
+            if let Some(store) = keystorage(data).with_context(|| format!("reading keystorage in {name}"))? {
+                if has_keystorage { bail!("BL archive contains multiple keystorage images") }
+                has_keystorage = true;
+                firmware_key = store.firmware_key;
+            }
             if let Ok(parsed) = avb::parse(blob::bytes(data.clone())) {
                 if parsed.footer.is_none() {
                     if vbmeta.is_some() { bail!("BL archive contains multiple standalone AVB images") }
@@ -106,6 +172,7 @@ impl Catalog {
             version: versions.into_iter().next().context("BL firmware version is missing")?,
             templates,
             vbmeta,
+            firmware_key,
         })
     }
 
@@ -120,4 +187,13 @@ impl Catalog {
     }
 
     pub(super) fn vbmeta(&self) -> Option<Blob> { self.vbmeta.clone().map(blob::bytes) }
+
+    pub(super) fn firmware_key(&self) -> Option<&[u8]> { self.firmware_key.as_deref() }
+
+    pub(super) fn require_firmware_key(&self, keys: &crypto::Keys) -> Result<()> {
+        let actual = self.firmware_key.as_ref().context("BL keystorage has no fw_key; resign the BL with the current signer")?;
+        let expected = crypto::public_blob(&keys.ree);
+        if actual != &expected { bail!("BL keystorage fw_key does not match the configured REE key") }
+        Ok(())
+    }
 }

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2_10::{Digest, Sha256};
 
 use crate::{archive::TarIndex, io::ReadAt};
-use super::{avb::{self, Parsed}, blob, codesigner::{self, Template}, incremental};
+use super::{avb::{self, Parsed}, blob, codesigner::{self, Template}, crypto::{self, Keys}, incremental};
 
 const KIND: &str = "android-resigner-stock";
 const FORMAT: u32 = 1;
@@ -239,6 +239,8 @@ struct StockData {
     firmware: String,
     rollback: u32,
     config_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fw_key_sha256: Option<String>,
     sources: SourceHashes,
     images: BTreeMap<String, ImageRecord>,
     logical: BTreeMap<String, ImageRecord>,
@@ -260,7 +262,7 @@ impl Stock {
                       config_sha256: impl Into<String>, sources: SourceHashes) -> Result<Self> {
         let stock = Self { data: StockData {
             soc: soc.into(), firmware: firmware.into(), rollback,
-            config_sha256: config_sha256.into(), sources,
+            config_sha256: config_sha256.into(), fw_key_sha256: None, sources,
             images: BTreeMap::new(), logical: BTreeMap::new(),
         }};
         stock.validate(false)?; Ok(stock)
@@ -323,6 +325,20 @@ impl Stock {
         Ok(())
     }
 
+    pub(super) fn set_firmware_key(&mut self, value: &[u8]) -> Result<()> {
+        let old = self.data.fw_key_sha256.replace(digest(value));
+        if let Err(error) = self.validate(false) { self.data.fw_key_sha256 = old; return Err(error) }
+        Ok(())
+    }
+
+    pub(super) fn require_firmware_key(&self, keys: &Keys) -> Result<()> {
+        let actual = self.data.fw_key_sha256.as_ref()
+            .context("saved signing data has no fw_key identity; pass a provisioned BL once")?;
+        let expected = digest(&crypto::public_blob(&keys.ree));
+        if actual != &expected { bail!("saved fw_key does not match the configured REE key") }
+        Ok(())
+    }
+
     pub(super) fn set_logical(&mut self, name: &str, record: ImageRecord) -> Result<()> {
         if self.data.images.contains_key(name) { bail!("image and logical record share the name {name}") }
         let old = self.data.logical.insert(name.to_owned(), record);
@@ -381,6 +397,9 @@ impl Stock {
     fn validate(&self, require_images: bool) -> Result<()> {
         if !safe_name(&self.data.soc) || !valid_firmware(&self.data.firmware)
             || !valid_digest(&self.data.config_sha256) { bail!("invalid stock identity") }
+        if self.data.fw_key_sha256.as_ref().is_some_and(|value| !valid_digest(value)) {
+            bail!("invalid stock fw_key identity")
+        }
         self.data.sources.validate()?;
         let count = self.data.images.len().checked_add(self.data.logical.len()).context("stock record count overflow")?;
         if count > MAX_RECORDS || (require_images && self.data.images.is_empty()) { bail!("invalid stock record count") }

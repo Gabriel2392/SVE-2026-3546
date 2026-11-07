@@ -276,27 +276,113 @@ def stock_keys(fld: bytes, image_type: int = 4) -> tuple[ec.EllipticCurvePublicK
     return pub_key(fld[foot + 100:foot + 624]), pub_key(fld[foot + 624:foot + 1148])
 
 
-def replace_avb_keys(buf: bytearray, pub: bytes) -> list[int]:
-    if not buf.startswith(b"SLSI") or len(buf) < 0x24:
+def _key_table(buf: bytes | bytearray) -> tuple[int, int, int, int, int, int, int, int]:
+    if not buf.startswith(b"SLSI") or len(buf) < 48:
         raise ValueError("invalid SLSI keystorage")
-    off = _u32(buf, 8)
+    version = _u32(buf, 4)
+    if version not in (0x20, 0x30, 0x40, 0x50):
+        raise ValueError("invalid keystorage version")
+    header = _u32(buf, 8)
     count = _u32(buf, 12)
-    total = _u32(buf, 0x20)
-    if not count or total % count or off < 0x24 or off + total > len(buf):
+    body = _u32(buf, 0x20)
+    record = 2592 if version >= 0x50 else 1056
+    whitelist = 24 if version >= 0x50 else 12
+    meta = 48 + (whitelist * 16 if version >= 0x30 else 0)
+    name_len = 16 if version >= 0x40 else 8
+    meta_len = name_len + 8
+    slots = (header - meta) // meta_len if header >= meta else 0
+    if (not count or header < meta or (header - meta) % meta_len
+            or count > slots or body != count * record
+            or header + body > len(buf)):
         raise ValueError("invalid keystorage table")
-    rec = total // count
-    if len(pub) > rec:
-        raise ValueError("AVB key does not fit the keystorage record")
+    return version, header, count, record, meta, name_len, meta_len, slots
+
+
+def replace_avb_keys(buf: bytearray, pub: bytes) -> list[int]:
+    _, header, count, record, meta, name_len, meta_len, _ = _key_table(buf)
     found = []
-    for idx in range(count):
-        at = off + idx * rec
-        size = avb_key_size(bytes(buf[at:at + rec]))
-        if size is None:
+    names = set()
+    for slot in range(count):
+        item = meta + slot * meta_len
+        raw_name = bytes(buf[item:item + name_len])
+        name = raw_name.split(b"\0", 1)[0]
+        if not name or any(raw_name[len(name):]) or name in names:
+            raise ValueError("invalid keystorage key name")
+        names.add(name)
+        index = _u32(buf, item + name_len)
+        kind = _u32(buf, item + name_len + 4)
+        at = header + slot * record
+        raw = bytes(buf[at:at + record])
+        if kind == 4:
+            if len(raw) < 524 or any(raw[524:]) or zlib.crc32(raw[:524]) != index:
+                raise ValueError("invalid keystorage P-384 key")
+            pub_key(raw[:524])
             continue
-        if size != len(pub):
+        if kind != 0xff:
+            raise ValueError("unsupported keystorage key type")
+        size = avb_key_size(raw)
+        if size is None or size != len(pub) or any(raw[size:]):
             raise ValueError("keystorage AVB key size mismatch")
         buf[at:at + size] = pub
+        _p32(buf, item + name_len, zlib.crc32(pub))
         found.append(at)
     if not found:
         raise ValueError("keystorage has no AVB keys")
     return found
+
+
+def provision_fw_key(buf: bytearray, pub: bytes) -> int:
+    version, header, count, record, meta, name_len, meta_len, slots = _key_table(buf)
+    if version < 0x40 or len(pub) != 524:
+        raise ValueError("unsupported keystorage firmware key")
+    pub_key(pub)
+    index = zlib.crc32(pub)
+    if not index:
+        raise ValueError("invalid keystorage firmware key index")
+    target = None
+    indexes = set()
+    names = set()
+    for slot in range(count):
+        item = meta + slot * meta_len
+        raw_name = bytes(buf[item:item + name_len])
+        name = raw_name.split(b"\0", 1)[0]
+        current = _u32(buf, item + name_len)
+        if not name or any(raw_name[len(name):]) or name in names or current in indexes:
+            raise ValueError("duplicate keystorage key")
+        names.add(name)
+        indexes.add(current)
+        if name == b"fw_key":
+            if target is not None or _u32(buf, item + name_len + 4) != 4:
+                raise ValueError("invalid keystorage firmware key")
+            target = slot
+    if target is None:
+        if index in indexes:
+            raise ValueError("duplicate keystorage firmware key")
+        if count >= slots:
+            raise ValueError("keystorage metadata is full")
+        target = count
+        item = meta + target * meta_len
+        raw_name = bytes(buf[item:item + name_len])
+        empty = (bytes(name_len), b"none" + bytes(name_len - 4))
+        if raw_name not in empty or any(buf[item + name_len:item + meta_len]):
+            raise ValueError("keystorage metadata slot is not empty")
+        at = header + target * record
+        if at + record > boundary(buf) - ST2_FOOTER or any(buf[at:at + record]):
+            raise ValueError("keystorage body slot is not empty")
+        _p32(buf, 12, count + 1)
+        _p32(buf, 0x20, (count + 1) * record)
+    item = meta + target * meta_len
+    at = header + target * record
+    if at + record > boundary(buf) - ST2_FOOTER or any(buf[at + 524:at + record]):
+        raise ValueError("invalid keystorage firmware key body")
+    if target < count:
+        old = bytes(buf[at:at + 524])
+        old_index = _u32(buf, item + name_len)
+        pub_key(old)
+        if zlib.crc32(old) != old_index or index in indexes - {old_index}:
+            raise ValueError("invalid keystorage firmware key")
+    buf[item:item + name_len] = b"fw_key" + bytes(name_len - 6)
+    _p32(buf, item + name_len, index)
+    _p32(buf, item + name_len + 4, 4)
+    buf[at:at + 524] = pub
+    return at

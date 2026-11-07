@@ -115,6 +115,7 @@ fn derive_stock(cfg_raw: &[u8], cfg: &Config, src: &StockInput, bl: &Path,
     let cat = Catalog::open(bl)?;
     if !codesigner::same_model(&fw, cat.version()) || rb != cat.normal(cfg.android.st2_key_type)?.rollback()? { bail!("BL and AP firmware do not match") }
     let mut stock = Stock::new(&cfg.soc, &fw, rb, sha256_bytes(cfg_raw), hashes)?;
+    if let Some(key) = cat.firmware_key() { stock.set_firmware_key(key)?; }
     for (name, rule) in &cfg.android.image_rules {
         let source = if name == main { cat.vbmeta().context("BL archive has no vbmeta.img")? } else { src.image(name)? };
         let mut rec = independent::record_from_stock(name, source, rule, None)?;
@@ -238,6 +239,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     }
     let (raw, cfg) = load_config(&root, o.soc)?;
     cfg.validate_image_rules()?;
+    let keys = Keys::load(&root, &cfg.signing)?;
     let names = cfg.android.archive.iter().chain(&cfg.android.vbmeta).cloned().collect::<Vec<_>>();
     let mut base = StockInput::single(&o.base, names)?;
     let mut stock = if let Some(stock) = Stock::from_archive(&o.base)? {
@@ -254,6 +256,8 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     if let Some(bl) = &o.bl {
         let bl_hash = sha256_file(bl)?;
         let cat = Catalog::open(bl)?;
+        cat.require_firmware_key(&keys)?;
+        stock.set_firmware_key(cat.firmware_key().context("BL keystorage has no fw_key")?)?;
         if !codesigner::same_model(cat.version(), stock.firmware()) || cat.normal(cfg.android.st2_key_type)?.rollback()? != stock.rollback() {
             bail!("BL and AP firmware do not match")
         }
@@ -291,9 +295,10 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     }
     let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path, scratch)).transpose()?;
     let aosp_catalog = if aosp.is_some() {
-        Some(Catalog::open(o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?)?)
+        let catalog = Catalog::open(o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?)?;
+        catalog.require_firmware_key(&keys)?;
+        Some(catalog)
     } else { None };
-    let keys = Keys::load(&root, &cfg.signing)?;
     let mut physical = inputs(o.images, &cfg.android.image_rules)?;
     if let Some(aosp) = &aosp {
         for name in cfg.android.archive.iter().filter(|name| *name != &cfg.android.super_image) {
@@ -565,6 +570,8 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     if let Some(path) = &options.aosp_zip {
         if !path.is_file() { bail!("AOSP ZIP does not exist or is not a file: {}", path.display()) }
     }
+    let keys = Keys::load(&root, &config.signing)?;
+    Catalog::open(bl)?.require_firmware_key(&keys)?;
     let output = if options.output.is_dir() { options.output.join("AP_RESIGNED.tar.md5") } else { options.output.clone() };
     let parent = output_parent(&output);
     fs::create_dir_all(parent).with_context(|| format!("creating output directory {}", parent.display()))?;
@@ -588,7 +595,6 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     let requested = config.android.archive.iter().chain(&config.android.vbmeta).cloned().collect::<Vec<_>>();
     eprintln!("Mapping firmware");
     let mut input = StockInput::open(&options.ap, &options.cp, &options.csc, requested)?;
-    let keys = Keys::load(&root, &config.signing)?;
     let hashes = SourceHashes::from_paths(bl, &options.ap, &options.cp, &options.csc)?;
     let mut stock = derive_stock(&cfg_raw, &config, &input, bl, hashes, true)?;
     stock.require_config(&cfg_raw)?;

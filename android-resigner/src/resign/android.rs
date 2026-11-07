@@ -168,21 +168,33 @@ fn logical(config: &Config, stock: Blob, name: &str, keys: &Keys) -> Result<(Blo
         }
         let mut firmware = rules.sign_firmware.iter().cloned().collect::<BTreeSet<_>>();
         let detected = if rules.discover_firmware {
-            let paths = erofs::signed_firmware_paths(payload.clone()).with_context(|| format!("discovering signed firmware in {name}"))?;
-            firmware.extend(paths.iter().cloned()); paths
+            let files = erofs::signed_firmware(payload.clone()).with_context(|| format!("discovering signed firmware in {name}"))?;
+            firmware.extend(files.iter().map(|file| file.path.clone())); files
         } else { Vec::new() };
         for path in &firmware {
             let mut data = erofs::read(payload.clone(), path).with_context(|| format!("reading {name}:/{path}"))?;
-            let key = codesigner::sign_firmware(&mut data, keys, &format!("/{name}/{path}"))?;
+            let original = data.clone();
+            let ranges = codesigner::sign_firmware(&mut data, keys, &format!("/{name}/{path}"))?;
+            for range in ranges.iter().filter(|range| range.key_type == 2) {
+                if data[range.start..range.end] != original[range.start..range.end] {
+                    bail!("{name}:{path}: type 2 firmware changed")
+                }
+            }
             payload = erofs::replace(payload, path, &data).with_context(|| format!("COW signing {name}:/{path}"))?;
-            eprintln!("CodeSigned {name}:{path} ({})", if key == 0 { "TEE" } else { "REE" });
+            for range in ranges.iter().filter(|range| range.key_type <= 1) {
+                eprintln!("CodeSigned {name}:{path} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
+            }
         }
         if rules.discover_firmware {
-            let after = erofs::signed_firmware_paths(payload.clone()).with_context(|| format!("auditing signed firmware in rebuilt {name}"))?;
-            if after != detected { bail!("{name}: signed firmware set changed during rebuild: before={detected:?}, after={after:?}") }
-            for path in &after {
-                let data = erofs::read(payload.clone(), path)?;
-                codesigner::verify_firmware(&data, keys, &format!("/{name}/{path}"))?;
+            let after = erofs::signed_firmware(payload.clone()).with_context(|| format!("verifying signed firmware in rebuilt {name}"))?;
+            if after.len() != detected.len() || detected.iter().zip(&after).any(|(old, new)| {
+                old.path != new.path || codesigner::runtime_layout(&old.ranges, keys) != new.ranges
+            }) { bail!("{name}: signed firmware set changed during rebuild: before={detected:?}, after={after:?}") }
+            for file in &after {
+                let data = erofs::read(payload.clone(), &file.path)?;
+                if codesigner::verify_firmware(&data, keys, &format!("/{name}/{}", file.path))? != file.ranges {
+                    bail!("{name}: CodeSigner verification changed ranges for {}", file.path)
+                }
             }
         }
         }
@@ -294,6 +306,7 @@ pub(super) fn build(config: &Config, input: &dyn ImageSource, keys: &Keys, bl: O
     let main_source = input.image(main_vbmeta)?;
     let build_id = codesigner::extract(&main_source, main_source.len()?)?.firmware_version()?;
     if let Some(catalog) = &catalog {
+        catalog.require_firmware_key(keys)?;
         if !codesigner::same_model(&build_id, catalog.version()) {
             bail!("BL/AP firmware mismatch: BL {}, AP {build_id}", catalog.version())
         }

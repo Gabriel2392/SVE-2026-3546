@@ -277,18 +277,22 @@ fn patch_newc(
         if !entry.regular {
             continue;
         }
-        let Some(_key_type) = codesigner::firmware_key_type(&data[entry.data.clone()]) else {
-            continue;
-        };
+        let body = &data[entry.data.clone()];
+        if body.get(..4) != Some(b"\x7fELF") && codesigner::firmware_key_type(body).is_none() { continue }
+        let ranges = codesigner::firmware_ranges(body)?;
+        if ranges.is_empty() { continue }
         if !configured && !rules.discover_firmware {
             continue;
         }
 
-        let key_type = codesigner::sign_firmware(
+        let ranges = codesigner::sign_firmware(
             &mut data[entry.data.clone()],
             keys,
             &format!("{description}:{name}"),
         )?;
+        let signed = ranges.iter().filter(|range| range.key_type <= 1).collect::<Vec<_>>();
+        if configured { found.insert(name.clone()); }
+        if signed.is_empty() { continue }
         if entry.crc {
             let checksum = data[entry.data.clone()]
                 .iter()
@@ -296,27 +300,26 @@ fn patch_newc(
             data[entry.header + 102..entry.header + 110]
                 .copy_from_slice(format!("{checksum:08x}").as_bytes());
         }
-        if configured {
-            found.insert(name.clone());
+        for range in &signed {
+            eprintln!("CodeSigned {description}:{name} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
         }
-        changed.push((index, key_type));
-        eprintln!("CodeSigned {description}:{name} ({})", if key_type == 0 { "TEE" } else { "REE" });
+        changed.push((index, ranges));
     }
 
-    let audited = entries(&data)?;
-    if audited.len() != list.len() {
+    let updated = entries(&data)?;
+    if updated.len() != list.len() {
         bail!("{description}: newc entry set changed while signing firmware")
     }
-    for (index, key_type) in &changed {
-        let entry = &audited[*index];
+    for (index, ranges) in &changed {
+        let entry = &updated[*index];
         let name = entry.name.as_deref().unwrap_or("<non-UTF8>");
         let actual = codesigner::verify_firmware(
             &data[entry.data.clone()],
             keys,
             &format!("{description}:{name}"),
         )?;
-        if actual != *key_type {
-            bail!("{description}:{name}: CodeSigner key mode changed during rebuild")
+        if actual != codesigner::runtime_layout(ranges, keys) {
+            bail!("{description}:{name}: CodeSigner layout changed during rebuild")
         }
     }
 

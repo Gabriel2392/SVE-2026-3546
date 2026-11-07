@@ -164,23 +164,40 @@ fn resign_filesystem(mut payload: Blob, rule: &Filesystem, keys: &Keys, descript
     for path in &rule.remove { payload = erofs::remove(payload, path)?; }
     let mut firmware = rule.sign_firmware.iter().cloned().collect::<BTreeSet<_>>();
     let detected = if rule.discover_firmware {
-        let value = erofs::signed_firmware_paths(payload.clone())?; firmware.extend(value.iter().cloned()); value
+        let value = erofs::signed_firmware(payload.clone())?; firmware.extend(value.iter().map(|file| file.path.clone())); value
     } else { Vec::new() };
+    let mut signed = 0;
     for path in &firmware {
         let mut data = erofs::read(payload.clone(), path)?;
-        let key = codesigner::sign_firmware(&mut data, keys, &format!("{description}:/{path}"))?;
-        codesigner::verify_firmware(&data, keys, &format!("{description}:/{path}"))?;
+        let original = data.clone();
+        let ranges = codesigner::sign_firmware(&mut data, keys, &format!("{description}:/{path}"))?;
+        if codesigner::verify_firmware(&data, keys, &format!("{description}:/{path}"))?
+            != codesigner::runtime_layout(&ranges, keys) {
+            bail!("{description}:/{path}: CodeSigner verification changed ranges")
+        }
+        for range in ranges.iter().filter(|range| range.key_type == 2) {
+            if data[range.start..range.end] != original[range.start..range.end] {
+                bail!("{description}:/{path}: type 2 firmware changed")
+            }
+        }
         payload = erofs::replace(payload, path, &data)?;
-        eprintln!("CodeSigned {description}:{path} ({})", if key == 0 { "TEE" } else { "REE" });
-    }
-    if rule.discover_firmware {
-        let after = erofs::signed_firmware_paths(payload.clone())?;
-        if after != detected { bail!("signed EROFS firmware set changed during independent signing") }
-        for path in &after {
-            codesigner::verify_firmware(&erofs::read(payload.clone(), path)?, keys, &format!("{description}:/{path}"))?;
+        for range in ranges.iter().filter(|range| range.key_type <= 1) {
+            eprintln!("CodeSigned {description}:{path} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
+            signed += 1;
         }
     }
-    Ok((payload, firmware.len()))
+    if rule.discover_firmware {
+        let after = erofs::signed_firmware(payload.clone())?;
+        if after.len() != detected.len() || detected.iter().zip(&after).any(|(old, new)| {
+            old.path != new.path || codesigner::runtime_layout(&old.ranges, keys) != new.ranges
+        }) { bail!("signed EROFS firmware set changed during independent signing") }
+        for file in &after {
+            if codesigner::verify_firmware(&erofs::read(payload.clone(), &file.path)?, keys, &format!("{description}:/{}", file.path))? != file.ranges {
+                bail!("{description}:/{}: CodeSigner verification changed ranges", file.path)
+            }
+        }
+    }
+    Ok((payload, signed))
 }
 
 fn add_avb(payload: Blob, stock: &Stock, record: &ImageRecord, rule: &ImageRule,
@@ -266,6 +283,7 @@ fn build(name: &str, source: Blob, stock: &Stock, rule: &ImageRule,
 
 pub(super) fn sign(name: &str, source: Blob, stock: &Stock, rule: &ImageRule,
                    keys: &Keys, policy: &AvbGenerationPolicy) -> Result<SignedImage> {
+    if rule.signs_firmware() { stock.require_firmware_key(keys)?; }
     build(name, source, stock, rule, keys, policy, true)
 }
 

@@ -27,7 +27,6 @@ pub(super) fn same_build_family(base: &str, candidate: &str) -> bool {
             && suffix[1..].bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     })
 }
-
 pub(super) fn same_model(base: &str, candidate: &str) -> bool {
     fn model(value: &str) -> Option<&str> {
         if !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') { return None }
@@ -113,6 +112,8 @@ pub fn present(source: &Blob, boundary: u64) -> Result<bool> {
 }
 
 fn le32(data: &[u8], at: usize) -> Result<u32> { Ok(u32::from_le_bytes(data.get(at..at + 4).context("truncated CodeSigner field")?.try_into().unwrap())) }
+fn le16(data: &[u8], at: usize) -> Result<u16> { Ok(u16::from_le_bytes(data.get(at..at + 2).context("truncated CodeSigner field")?.try_into().unwrap())) }
+fn le64(data: &[u8], at: usize) -> Result<u64> { Ok(u64::from_le_bytes(data.get(at..at + 8).context("truncated CodeSigner field")?.try_into().unwrap())) }
 fn set32(data: &mut [u8], at: usize, value: u32) -> Result<()> { data.get_mut(at..at + 4).context("truncated CodeSigner field")?.copy_from_slice(&value.to_le_bytes()); Ok(()) }
 
 fn info(template: &[u8], filename: &str) -> Result<Vec<u8>> {
@@ -217,7 +218,7 @@ pub fn firmware_key_type(data: &[u8]) -> Option<u32> {
     let key_type = le32(data, footer + 8).ok()?;
     let key_index = le32(data, footer + 12).ok()?;
     let signature = data.get(data.len() - EXCLUDED..data.len() - EXCLUDED + SIGNATURE)?;
-    if kind != 4 || key_type > 1 || key_index == 0 || signature[..20].iter().any(|&byte| byte != 0)
+    if kind != 4 || key_type > 2 || key_index == 0 || signature[..20].iter().any(|&byte| byte != 0)
         || signature[68..88].iter().any(|&byte| byte != 0)
         || signature[20..68].iter().all(|&byte| byte == 0)
         || signature[88..136].iter().all(|&byte| byte == 0) {
@@ -226,32 +227,183 @@ pub fn firmware_key_type(data: &[u8]) -> Option<u32> {
     Some(key_type)
 }
 
-pub fn sign_firmware(data: &mut [u8], keys: &Keys, description: &str) -> Result<u32> {
-    if data.len() < FOOTER { bail!("ST2 firmware is too small: {description}") }
-    let footer = data.len() - FOOTER;
-    if le32(data, footer + 4)? != 4 { bail!("{description} is not CodeSigner type 4") }
-    let key_type = le32(data, footer + 8)?;
-    let key = keys.st2(key_type).with_context(|| format!("invalid key mode in {description}"))?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirmwareRange { pub start: usize, pub end: usize, pub key_type: u32, pub key_index: u32 }
+
+impl FirmwareRange {
+    pub fn runtime(self, keys: &Keys) -> Self {
+        if self.key_type <= 1 { Self { key_type: 2, key_index: key_index(&keys.ree), ..self } } else { self }
+    }
+
+    pub fn repo(self, keys: &Keys) -> bool { self.key_type == 2 && self.key_index == key_index(&keys.ree) }
+}
+
+pub fn runtime_layout(ranges: &[FirmwareRange], keys: &Keys) -> Vec<FirmwareRange> {
+    ranges.iter().map(|range| range.runtime(keys)).collect()
+}
+
+fn checked_end(start: usize, count: usize, size: usize, limit: usize) -> Result<usize> {
+    start.checked_add(count.checked_mul(size).context("ELF table size overflow")?)
+        .filter(|&end| end <= limit).context("ELF table exceeds file")
+}
+
+fn elf_end(data: &[u8]) -> Result<Option<usize>> {
+    if data.get(..4) != Some(b"\x7fELF") { return Ok(None) }
+    if data.get(5) != Some(&1) { bail!("unsupported ELF byte order") }
+    let class = *data.get(4).context("truncated ELF header")?;
+    let (header, phoff, shoff, phsize, mut phnum, shsize, mut shnum) = match class {
+        1 => (52, le32(data, 28)? as usize, le32(data, 32)? as usize,
+            le16(data, 42)? as usize, le16(data, 44)? as usize,
+            le16(data, 46)? as usize, le16(data, 48)? as usize),
+        2 => (64, usize::try_from(le64(data, 32)?).context("ELF program offset overflow")?,
+            usize::try_from(le64(data, 40)?).context("ELF section offset overflow")?,
+            le16(data, 54)? as usize, le16(data, 56)? as usize,
+            le16(data, 58)? as usize, le16(data, 60)? as usize),
+        _ => bail!("unsupported ELF class {class}"),
+    };
+    if data.len() < header { bail!("truncated ELF header") }
+    if shoff != 0 && (shnum == 0 || phnum == 0xffff) {
+        if shsize < if class == 1 { 40 } else { 64 } || shoff.checked_add(shsize).is_none_or(|end| end > data.len()) {
+            bail!("invalid ELF section table")
+        }
+        if shnum == 0 {
+            shnum = if class == 1 { le32(data, shoff + 20)? as usize }
+                else { usize::try_from(le64(data, shoff + 32)?).context("ELF section count overflow")? };
+        }
+        if phnum == 0xffff { phnum = le32(data, shoff + if class == 1 { 28 } else { 44 })? as usize; }
+    }
+    if phnum != 0 && phsize < if class == 1 { 32 } else { 56 } { bail!("invalid ELF program header size") }
+    if shnum != 0 && shsize < if class == 1 { 40 } else { 64 } { bail!("invalid ELF section header size") }
+    let mut end = header;
+    if phnum != 0 {
+        end = end.max(checked_end(phoff, phnum, phsize, data.len())?);
+        for index in 0..phnum {
+            let at = phoff + index * phsize;
+            let (offset, size) = if class == 1 {
+                (le32(data, at + 4)? as usize, le32(data, at + 16)? as usize)
+            } else {
+                (usize::try_from(le64(data, at + 8)?).context("ELF segment offset overflow")?,
+                 usize::try_from(le64(data, at + 32)?).context("ELF segment size overflow")?)
+            };
+            end = end.max(offset.checked_add(size).filter(|&value| value <= data.len()).context("ELF segment exceeds file")?);
+        }
+    }
+    if shnum != 0 {
+        end = end.max(checked_end(shoff, shnum, shsize, data.len())?);
+        for index in 0..shnum {
+            let at = shoff + index * shsize;
+            if le32(data, at + 4)? == 8 { continue }
+            let (offset, size) = if class == 1 {
+                (le32(data, at + 16)? as usize, le32(data, at + 20)? as usize)
+            } else {
+                (usize::try_from(le64(data, at + 24)?).context("ELF section offset overflow")?,
+                 usize::try_from(le64(data, at + 32)?).context("ELF section size overflow")?)
+            };
+            end = end.max(offset.checked_add(size).filter(|&value| value <= data.len()).context("ELF section exceeds file")?);
+        }
+    }
+    Ok(Some(end))
+}
+
+fn firmware_footer(data: &[u8], at: usize) -> Option<(u32, u32)> {
+    let end = at.checked_add(FOOTER)?;
+    if end > data.len() || le32(data, at + 4).ok()? != 4 { return None }
+    let key_type = le32(data, at + 8).ok()?;
+    let index = le32(data, at + 12).ok()?;
+    let signature = data.get(at + HEADER..at + HEADER + SIGNATURE)?;
+    if key_type > 2 || index == 0 || signature[..20].iter().any(|&byte| byte != 0)
+        || signature[68..88].iter().any(|&byte| byte != 0)
+        || signature[20..68].iter().all(|&byte| byte == 0)
+        || signature[88..136].iter().all(|&byte| byte == 0) { return None }
+    Some((key_type, index))
+}
+
+pub fn firmware_ranges(data: &[u8]) -> Result<Vec<FirmwareRange>> {
+    if data.len() < FOOTER { return Ok(Vec::new()) }
+    let mut candidates = Vec::new();
+    for marker in data.windows(4).enumerate().filter_map(|(at, value)| (value == 4u32.to_le_bytes()).then_some(at)) {
+        let Some(footer) = marker.checked_sub(4) else { continue };
+        let Some(end) = footer.checked_add(FOOTER).filter(|&end| end <= data.len()) else { continue };
+        let Some((key_type, index)) = firmware_footer(data, footer) else { continue };
+        candidates.push((footer, end, key_type, index));
+    }
+    if candidates.is_empty() { return Ok(Vec::new()) }
+    let mut ranges = Vec::<FirmwareRange>::new();
+    let mut elf = None;
+    for (footer, end, key_type, index) in candidates {
+        let signature_at = footer + HEADER;
+        let signature = &data[signature_at..signature_at + SIGNATURE];
+        let suffix = data.len() - end;
+        let mut starts = vec![0];
+        for range in &ranges {
+            if let Some(start) = range.end.checked_add(suffix).filter(|&start| start < footer) {
+                if !starts.contains(&start) { starts.push(start); }
+            }
+        }
+        let mut found = Vec::new();
+        for start in starts {
+            let digest = Sha512::digest(&data[start..signature_at]);
+            if crypto::recover_padded(&digest, signature, index)?.is_some() { found.push(start); }
+        }
+        if found.is_empty() {
+            let at = match elf { Some(value) => value, None => { let value = elf_end(data)?; elf = Some(value); value } };
+            if let Some(at) = at.filter(|&at| at < footer) {
+                let digest = Sha512::digest(&data[at..signature_at]);
+                if crypto::recover_padded(&digest, signature, index)?.is_some() { found.push(at); }
+            }
+        }
+        found.sort_unstable(); found.dedup();
+        if found.len() > 1 { bail!("ambiguous CodeSigner firmware range at {footer:#x}") }
+        if let Some(start) = found.pop() {
+            ranges.push(FirmwareRange { start, end, key_type, key_index: index });
+        }
+    }
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    for pair in ranges.windows(2) {
+        if pair[0].end > pair[1].start { bail!("overlapping CodeSigner firmware ranges") }
+    }
+    Ok(ranges)
+}
+
+fn sign_range(data: &mut [u8], range: FirmwareRange, keys: &Keys, description: &str) -> Result<()> {
+    if range.key_type > 1 { bail!("invalid runtime key mode in {description}") }
+    let key = &keys.ree;
+    let footer = range.end - FOOTER;
+    set32(data, footer + 8, 2)?;
     set32(data, footer + 12, key_index(key))?;
-    let signature_at = data.len() - EXCLUDED;
-    let digest = Sha512::digest(&data[..signature_at]);
+    let signature_at = range.end - EXCLUDED;
+    let digest = Sha512::digest(&data[range.start..signature_at]);
     let signature = crypto::padded_signature(key, &digest)?;
     data[signature_at..signature_at + SIGNATURE].copy_from_slice(&signature);
     if !crypto::verify_padded(key.verifying_key(), &digest, &signature) { bail!("CodeSigner verification failed for {description}") }
-    Ok(key_type)
+    Ok(())
 }
 
-pub fn verify_firmware(data: &[u8], keys: &Keys, description: &str) -> Result<u32> {
-    let key_type = firmware_key_type(data).with_context(|| format!("no valid CodeSigner v5 footer in {description}"))?;
-    let key = keys.st2(key_type)?;
-    let footer = data.len() - FOOTER;
-    if le32(data, footer + 12)? != key_index(key) { bail!("CodeSigner key index mismatch for {description}") }
-    let signature_at = data.len() - EXCLUDED;
-    let digest = Sha512::digest(&data[..signature_at]);
-    if !crypto::verify_padded(key.verifying_key(), &digest, &data[signature_at..signature_at + SIGNATURE]) {
-        bail!("CodeSigner signature does not match the selected {} key for {description}", if key_type == 0 { "TEE" } else { "REE" })
+pub fn sign_firmware(data: &mut [u8], keys: &Keys, description: &str) -> Result<Vec<FirmwareRange>> {
+    let before = firmware_ranges(data)?;
+    if before.is_empty() { bail!("no valid CodeSigner firmware in {description}") }
+    for &range in &before { if range.key_type <= 1 { sign_range(data, range, keys, description)?; } }
+    let after = verify_firmware(data, keys, description)?;
+    if runtime_layout(&before, keys) != after { bail!("CodeSigner firmware layout changed in {description}") }
+    Ok(before)
+}
+
+pub fn verify_firmware(data: &[u8], keys: &Keys, description: &str) -> Result<Vec<FirmwareRange>> {
+    let ranges = firmware_ranges(data)?;
+    if ranges.is_empty() { bail!("no valid CodeSigner firmware in {description}") }
+    for range in &ranges {
+        let key = if range.key_type <= 1 { keys.st2(range.key_type)? }
+            else if range.repo(keys) { &keys.ree } else { continue };
+        let footer = range.end - FOOTER;
+        if le32(data, footer + 12)? != key_index(key) { bail!("CodeSigner key index mismatch for {description}") }
+        let signature_at = range.end - EXCLUDED;
+        let digest = Sha512::digest(&data[range.start..signature_at]);
+        if !crypto::verify_padded(key.verifying_key(), &digest, &data[signature_at..signature_at + SIGNATURE]) {
+            bail!("CodeSigner signature does not match the selected {} key for {description}", if range.key_type == 0 { "TEE" } else { "REE" })
+        }
     }
-    Ok(key_type)
+    Ok(ranges)
 }
 
 pub fn sparse_template(source: &Blob) -> Result<Vec<u8>> {

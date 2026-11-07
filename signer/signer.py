@@ -170,6 +170,7 @@ def _sign_part(data: bytearray, part: Part, layout: Layout,
                keys: cs.Keys, rb: int | None) -> None:
     if part.avb_keys:
         cs.replace_avb_keys(data, keys.avb_pub)
+        cs.provision_fw_key(data, cs.pub_blob(keys.ree))
     if part.stage == "st1":
         cs.sign_st1(data, keys, rb, layout.signing_type)
     elif part.stage == "st2":
@@ -278,8 +279,9 @@ def check(images: dict[str, bytes], layout: Layout,
             if part.avb_keys and keys is not None:
                 check = bytearray(raw)
                 rec["avb_key_offsets"] = [f"{off:#x}" for off in cs.replace_avb_keys(check, keys.avb_pub)]
+                rec["firmware_key_offset"] = f"{cs.provision_fw_key(check, cs.pub_blob(keys.ree)):#x}"
                 if check != raw:
-                    raise ValueError("keystorage AVB keys were not replaced")
+                    raise ValueError("keystorage keys were not replaced")
             item["parts"].append(rec)
         if img.stage == "st2":
             item.update(cs.verify_st2(

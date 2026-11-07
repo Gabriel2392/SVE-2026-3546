@@ -8,7 +8,7 @@ use super::{blob::{self, Blob}, codesigner};
 const MAGIC: u32 = 0xe0f5_e1e2;
 const SB: u64 = 1024;
 const SB_CSUM: u32 = 1;
-const SHARED_PCLUSTER: u32 = 0x20;
+const FRAGMENTS: u32 = 0x20;
 const MAX_FILE: u64 = 512 << 20;
 const PLAIN: u8 = 0;
 const FULL: u8 = 1;
@@ -33,10 +33,10 @@ fn sb_crc(source: &Blob, block: u64) -> Result<(u32, u32)> {
 }
 
 #[derive(Clone, Copy)]
-struct Inode { at: u64, layout: u8, mode: u16, size: u64, data: u32, header: u64, xattrs: u64 }
+struct Inode { nid: u64, at: u64, layout: u8, mode: u16, size: u64, data: u32, header: u64, xattrs: u64 }
 
 #[derive(Clone)]
-struct Fs { source: Blob, block: u64, block_bits: u8, dir_block: usize, meta: u64, root: u64, zero_padding: bool, checksum: bool, shared: bool }
+struct Fs { source: Blob, block: u64, blocks: u32, block_bits: u8, dir_block: usize, meta: u64, root: u64, zero_padding: bool, checksum: bool, fragments: bool }
 
 #[derive(Clone, Copy)]
 struct Map { end: u64, advise: u16, algorithms: u8, bits: u8 }
@@ -47,8 +47,14 @@ struct Cluster { lcn: usize, kind: u8, cluster_ofs: usize, delta0: u16, delta1: 
 #[derive(Clone, Copy)]
 struct Extent { logical: usize, logical_len: usize, physical: u64, physical_len: usize, algorithm: u8, encoded: bool }
 
+#[derive(Clone, Copy)]
+struct Physical { start: u64, end: u64, nid: u64 }
+
 #[derive(Clone)]
 struct Dirent { raw: [u8; 12], name: Vec<u8> }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FirmwareFile { pub path: String, pub ranges: Vec<codesigner::FirmwareRange> }
 
 fn valid_path(path: &str) -> Result<()> {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.split('/').any(|part| matches!(part, "" | "." | "..")) { bail!("invalid EROFS path {path:?}") }
@@ -96,11 +102,13 @@ impl Fs {
         let dir_block = if dir_bits == 0 { block } else { 1u64.checked_shl(dir_bits.into()).context("invalid EROFS directory block size")? };
         if dir_block < 512 || dir_block > 1 << 20 { bail!("unsupported EROFS directory block size {dir_block}") }
         let meta = (u32le(&sb, 40)? as u64).checked_mul(block).context("EROFS metadata offset overflow")?;
+        let blocks = u32le(&sb, 36)?; let source_len = source.len()?;
+        if (blocks as u64).checked_mul(block).is_none_or(|end| end > source_len) { bail!("EROFS blocks exceed image") }
         let checksum = u32le(&sb, 8)? & SB_CSUM != 0;
         if checksum { let (saved, actual) = sb_crc(&source, block)?; if saved != actual { bail!("invalid EROFS superblock checksum: {saved:08x} != {actual:08x}") } }
         let incompatible = u32le(&sb, 80)?;
-        Ok(Self { source, block, block_bits, dir_block: dir_block as usize, meta, root: u16le(&sb, 14)? as u64,
-            zero_padding: incompatible & 1 != 0, checksum, shared: incompatible & SHARED_PCLUSTER != 0 })
+        Ok(Self { source, block, blocks, block_bits, dir_block: dir_block as usize, meta, root: u16le(&sb, 14)? as u64,
+            zero_padding: incompatible & 1 != 0, checksum, fragments: incompatible & FRAGMENTS != 0 })
     }
 
     fn inode(&self, nid: u64) -> Result<Inode> {
@@ -113,7 +121,7 @@ impl Fs {
         let xattrs = if xattr_count == 0 { 0 } else { 12 + (xattr_count - 1) * 4 };
         let layout = ((format >> 1) & 7) as u8;
         if !matches!(layout, PLAIN | FULL | INLINE | COMPACT) { bail!("unsupported EROFS inode layout {layout}") }
-        Ok(Inode { at, layout, mode: u16le(&data, 4)?, size, data: u32le(&data, 16)?, header, xattrs })
+        Ok(Inode { nid, at, layout, mode: u16le(&data, 4)?, size, data: u32le(&data, 16)?, header, xattrs })
     }
 
     fn flat_ranges(&self, inode: Inode) -> Result<Vec<(u64, usize, usize)>> {
@@ -283,7 +291,49 @@ impl Fs {
         self.read_inode_range(inode, 0, inode.size as usize)
     }
 
-    fn signed_files(&self, nid: u64, prefix: &str, seen: &mut BTreeSet<u64>, out: &mut Vec<String>) -> Result<()> {
+    fn inode_refs(&self, nid: u64, seen: &mut BTreeSet<u64>, out: &mut Vec<Physical>) -> Result<()> {
+        if !seen.insert(nid) { return Ok(()) }
+        crate::cancel::check()?;
+        let inode = self.inode(nid)?;
+        let kind = inode.mode & 0o170000;
+        if matches!(kind, 0o040000 | 0o100000 | 0o120000) {
+            if matches!(inode.layout, PLAIN | INLINE) {
+                for (start, _, len) in self.flat_ranges(inode)? {
+                    out.push(Physical { start, end: start.checked_add(len as u64).context("EROFS physical range overflow")?, nid });
+                }
+            } else {
+                let map = self.map(inode)?; let mut at = 0;
+                while at < inode.size as usize {
+                    let extent = self.extent(inode, map, at)?;
+                    out.push(Physical { start: extent.physical,
+                        end: extent.physical.checked_add(extent.physical_len as u64).context("EROFS physical range overflow")?, nid });
+                    at = extent.logical.checked_add(extent.logical_len).context("EROFS logical range overflow")?;
+                }
+            }
+        }
+        if kind == 0o040000 {
+            for block in self.read_inode(inode)?.chunks(self.dir_block) {
+                for entry in dirents(block)? {
+                    if matches!(entry.name.as_slice(), b"." | b"..") { continue }
+                    self.inode_refs(u64::from_le_bytes(entry.raw[..8].try_into().unwrap()), seen, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn references(&self) -> Result<Vec<Physical>> {
+        let mut out = Vec::new(); let mut seen = BTreeSet::new();
+        self.inode_refs(self.root, &mut seen, &mut out)?; Ok(out)
+    }
+
+    fn exclusive(inode: Inode, start: u64, len: usize, refs: &[Physical]) -> Result<bool> {
+        let end = start.checked_add(len as u64).context("EROFS physical range overflow")?;
+        let mut owners = refs.iter().filter(|item| item.start < end && start < item.end);
+        Ok(owners.next().is_some_and(|item| item.nid == inode.nid) && owners.next().is_none())
+    }
+
+    fn signed_files(&self, nid: u64, prefix: &str, seen: &mut BTreeSet<u64>, out: &mut Vec<FirmwareFile>) -> Result<()> {
         if !seen.insert(nid) { return Ok(()) }
         let inode = self.inode(nid)?;
         match inode.mode & 0o170000 {
@@ -301,8 +351,13 @@ impl Fs {
                 }
             }
             0o100000 if inode.size >= 0x210 && inode.size <= MAX_FILE => {
+                crate::cancel::check()?;
+                let head = self.read_inode_range(inode, 0, 4)?;
                 let tail = self.read_inode_range(inode, inode.size - 0x210, 0x210)?;
-                if codesigner::firmware_key_type(&tail).is_some() { out.push(prefix.to_owned()); }
+                if head == b"\x7fELF" || codesigner::firmware_key_type(&tail).is_some() {
+                    let ranges = codesigner::firmware_ranges(&self.read_inode(inode)?)?;
+                    if !ranges.is_empty() { out.push(FirmwareFile { path: prefix.to_owned(), ranges }); }
+                }
             }
             _ => {}
         }
@@ -335,22 +390,66 @@ impl Fs {
 
     fn find(&self, path: &str) -> Result<Inode> { self.find_opt(path)?.with_context(|| format!("EROFS path not found: {path}")) }
 
+    fn finish(&self, mut output: Blob) -> Result<Blob> {
+        if self.checksum {
+            let (saved, crc) = sb_crc(&output, self.block)?;
+            if saved != crc { output = blob::patch(output, vec![(SB + 4, crc.to_le_bytes().to_vec())])?; }
+        }
+        Ok(output)
+    }
+
+    fn clone_plain(&self, inode: Inode, data: &[u8]) -> Result<Blob> {
+        let count = data.len().div_ceil(self.block as usize);
+        let end = (self.blocks as usize).checked_add(count).context("EROFS block count overflow")?;
+        let bytes = count.checked_mul(self.block as usize).context("EROFS clone size overflow")?;
+        let at = (self.blocks as u64).checked_mul(self.block).context("EROFS clone offset overflow")?;
+        let limit = self.source.len()?;
+        if at > limit { bail!("EROFS block count exceeds its payload") }
+        let available = usize::try_from(limit - at).context("EROFS trailing size overflow")?;
+        let existing = available.min(bytes);
+        if existing != 0 {
+            let mut data = vec![0; existing]; self.source.read_exact_at(at, &mut data)?;
+            if data.iter().any(|&byte| byte != 0) { bail!("EROFS clone area is not empty") }
+        }
+        let mut raw = vec![0; bytes];
+        raw[..data.len()].copy_from_slice(data);
+        let mut format = [0; 2]; self.source.read_exact_at(inode.at, &mut format)?;
+        let format = u16::from_le_bytes(format) & !0x0e;
+        let mut patches = vec![
+            (inode.at, format.to_le_bytes().to_vec()),
+            (inode.at + 16, self.blocks.to_le_bytes().to_vec()),
+            (SB + 36, u32::try_from(end).context("EROFS block count exceeds 32 bits")?.to_le_bytes().to_vec()),
+        ];
+        if existing != 0 { patches.push((at, raw[..existing].to_vec())); }
+        let output = blob::patch(self.source.clone(), patches)?;
+        let output = if existing == raw.len() { output } else {
+            blob::Concat::blob([output, blob::bytes(raw[existing..].to_vec())])?
+        };
+        self.finish(output)
+    }
+
     fn rewrite(&self, inode: Inode, old: &[u8], new: &[u8]) -> Result<Blob> {
         if old.len() != new.len() || old.len() as u64 != inode.size { bail!("EROFS COW replacement size changed: {} != {}", new.len(), inode.size) }
         if old == new { return Ok(self.source.clone()) }
-        if self.shared { bail!("EROFS COW refuses a filesystem with shared pclusters or fragments") }
-        let mut patches = Vec::new();
+        if self.fragments { return self.clone_plain(inode, new) }
+        let refs = self.references()?; let mut patches = Vec::new();
         if matches!(inode.layout, PLAIN | INLINE) {
-            for (physical, logical, len) in self.flat_ranges(inode)? { diff(physical, &old[logical..logical + len], &new[logical..logical + len], &mut patches) }
+            for (physical, logical, len) in self.flat_ranges(inode)? {
+                if old[logical..logical + len] != new[logical..logical + len] {
+                    if !Self::exclusive(inode, physical, len, &refs)? { return self.clone_plain(inode, new) }
+                    diff(physical, &old[logical..logical + len], &new[logical..logical + len], &mut patches)
+                }
+            }
         } else {
             let map = self.map(inode)?; let mut at = 0;
             while at < new.len() {
                 let extent = self.extent(inode, map, at)?; let range = extent.logical..extent.logical + extent.logical_len;
                 if old[range.clone()] != new[range.clone()] {
+                    if !Self::exclusive(inode, extent.physical, extent.physical_len, &refs)? { return self.clone_plain(inode, new) }
                     if extent.encoded {
-                        if extent.algorithm != 0 { bail!("cannot rewrite EROFS compression algorithm {}", extent.algorithm) }
+                        if extent.algorithm != 0 { return self.clone_plain(inode, new) }
                         let encoded = block::compress(&new[range.clone()], Some(CompressionMode::HIGHCOMPRESSION(12)), false)?;
-                        if encoded.len() > extent.physical_len { bail!("updated EROFS extent grew beyond its {}-byte pcluster: {} bytes", extent.physical_len, encoded.len()) }
+                        if encoded.len() > extent.physical_len { return self.clone_plain(inode, new) }
                         let mut data = vec![0; extent.physical_len];
                         let at = if self.zero_padding { data.len() - encoded.len() } else { 0 }; data[at..at + encoded.len()].copy_from_slice(&encoded);
                         let decoded = block::decompress(&encoded, Some(extent.logical_len as i32))?;
@@ -361,9 +460,7 @@ impl Fs {
                 at = extent.logical + extent.logical_len;
             }
         }
-        let mut output = blob::patch(self.source.clone(), patches)?;
-        if self.checksum { let (saved, crc) = sb_crc(&output, self.block)?; if saved != crc { output = blob::patch(output, vec![(SB + 4, crc.to_le_bytes().to_vec())])? } }
-        Ok(output)
+        self.finish(blob::patch(self.source.clone(), patches)?)
     }
 
     fn unlink(&self, path: &str) -> Result<Blob> {
@@ -418,9 +515,9 @@ fn diff(base: u64, old: &[u8], new: &[u8], out: &mut Vec<(u64, Vec<u8>)>) {
 
 pub fn read(source: Blob, path: &str) -> Result<Vec<u8>> { let fs = Fs::open(source)?; let inode = fs.find(path)?; fs.read_inode(inode) }
 
-pub fn signed_firmware_paths(source: Blob) -> Result<Vec<String>> {
+pub(super) fn signed_firmware(source: Blob) -> Result<Vec<FirmwareFile>> {
     let fs = Fs::open(source)?; let mut out = Vec::new(); let mut seen = BTreeSet::new();
-    fs.signed_files(fs.root, "", &mut seen, &mut out)?; out.sort(); Ok(out)
+    fs.signed_files(fs.root, "", &mut seen, &mut out)?; out.sort_by(|left, right| left.path.cmp(&right.path)); Ok(out)
 }
 
 pub fn replace(source: Blob, path: &str, data: &[u8]) -> Result<Blob> {

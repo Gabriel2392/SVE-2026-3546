@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{bail, Context, Result};
+use ecdsa::RecoveryId;
 use p384::{EncodedPoint, ecdsa::{Signature, SigningKey, VerifyingKey, signature::hazmat::{PrehashSigner, PrehashVerifier}}, pkcs8::DecodePrivateKey};
 use rsa::{BigUint, RsaPrivateKey, traits::PublicKeyParts};
 
@@ -42,13 +43,15 @@ impl Keys {
     }
 }
 
-pub fn public_blob(key: &SigningKey) -> Vec<u8> {
-    let point = key.verifying_key().to_encoded_point(false);
+pub fn verifying_blob(key: &VerifyingKey) -> Vec<u8> {
+    let point = key.to_encoded_point(false);
     let mut blob = vec![0; 524];
     blob[20..68].copy_from_slice(point.x().unwrap());
     blob[88..136].copy_from_slice(point.y().unwrap());
     blob
 }
+
+pub fn public_blob(key: &SigningKey) -> Vec<u8> { verifying_blob(key.verifying_key()) }
 
 pub fn padded_signature(key: &SigningKey, digest: &[u8]) -> Result<[u8; 136]> {
     if digest.len() != 64 { bail!("P-384 CodeSigner digest is not SHA-512") }
@@ -65,6 +68,23 @@ pub fn verify_padded(key: &VerifyingKey, digest: &[u8], encoded: &[u8]) -> bool 
     let s: [u8; 48] = encoded[88..136].try_into().unwrap();
     let Ok(signature) = Signature::from_scalars(r, s) else { return false };
     key.verify_prehash(digest, &signature).is_ok()
+}
+
+pub fn recover_padded(digest: &[u8], encoded: &[u8], index: u32) -> Result<Option<VerifyingKey>> {
+    if digest.len() != 64 || encoded.len() != 136 || encoded[..20].iter().any(|&b| b != 0)
+        || encoded[68..88].iter().any(|&b| b != 0) { return Ok(None) }
+    let r: [u8; 48] = encoded[20..68].try_into().unwrap();
+    let s: [u8; 48] = encoded[88..136].try_into().unwrap();
+    let Ok(signature) = Signature::from_scalars(r, s) else { return Ok(None) };
+    let mut found = Vec::new();
+    for value in 0..=RecoveryId::MAX {
+        let id = RecoveryId::from_byte(value).unwrap();
+        let Ok(key) = VerifyingKey::recover_from_prehash(digest, &signature, id) else { continue };
+        if crc32fast::hash(&verifying_blob(&key)) == index && verify_padded(&key, digest, encoded)
+            && !found.iter().any(|old| old == &key) { found.push(key) }
+    }
+    if found.len() > 1 { bail!("ambiguous P-384 recovered key") }
+    Ok(found.pop())
 }
 
 fn public_key(data: &[u8]) -> Result<VerifyingKey> {
