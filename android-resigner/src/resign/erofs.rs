@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use lz4::block::{self, CompressionMode};
 
 use super::{blob::{self, Blob}, codesigner};
+use crate::par;
 
 const MAGIC: u32 = 0xe0f5_e1e2;
 const SB: u64 = 1024;
@@ -54,7 +55,7 @@ struct Physical { start: u64, end: u64, nid: u64 }
 struct Dirent { raw: [u8; 12], name: Vec<u8> }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct FirmwareFile { pub path: String, pub ranges: Vec<codesigner::FirmwareRange> }
+pub(super) struct FirmwareFile { pub path: String, pub ranges: Vec<codesigner::FirmwareRange>, pub data: Vec<u8> }
 
 fn valid_path(path: &str) -> Result<()> {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.split('/').any(|part| matches!(part, "" | "." | "..")) { bail!("invalid EROFS path {path:?}") }
@@ -333,7 +334,7 @@ impl Fs {
         Ok(owners.next().is_some_and(|item| item.nid == inode.nid) && owners.next().is_none())
     }
 
-    fn signed_files(&self, nid: u64, prefix: &str, seen: &mut BTreeSet<u64>, out: &mut Vec<FirmwareFile>) -> Result<()> {
+    fn regular_files(&self, nid: u64, prefix: &str, seen: &mut BTreeSet<u64>, out: &mut Vec<(String, Inode)>) -> Result<()> {
         if !seen.insert(nid) { return Ok(()) }
         let inode = self.inode(nid)?;
         match inode.mode & 0o170000 {
@@ -346,22 +347,25 @@ impl Fs {
                         if name.is_empty() || name.contains('/') || name.contains('\\') { bail!("unsafe EROFS filename {name:?}") }
                         let path = if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") };
                         let child = u64::from_le_bytes(entry.raw[..8].try_into().unwrap());
-                        self.signed_files(child, &path, seen, out)?;
+                        self.regular_files(child, &path, seen, out)?;
                     }
                 }
             }
-            0o100000 if inode.size >= 0x210 && inode.size <= MAX_FILE => {
-                crate::cancel::check()?;
-                let head = self.read_inode_range(inode, 0, 4)?;
-                let tail = self.read_inode_range(inode, inode.size - 0x210, 0x210)?;
-                if head == b"\x7fELF" || codesigner::firmware_key_type(&tail).is_some() {
-                    let ranges = codesigner::firmware_ranges(&self.read_inode(inode)?)?;
-                    if !ranges.is_empty() { out.push(FirmwareFile { path: prefix.to_owned(), ranges }); }
-                }
-            }
+            0o100000 if inode.size >= 0x210 && inode.size <= MAX_FILE => out.push((prefix.to_owned(), inode)),
             _ => {}
         }
         Ok(())
+    }
+
+    fn firmware(&self, path: &str, inode: Inode) -> Result<Option<FirmwareFile>> {
+        crate::cancel::check()?;
+        let head = self.read_inode_range(inode, 0, 4)?;
+        let tail = self.read_inode_range(inode, inode.size - 0x210, 0x210)?;
+        if head != b"\x7fELF" && codesigner::firmware_key_type(&tail).is_none() { return Ok(None) }
+        let data = self.read_inode(inode)?;
+        let ranges = codesigner::firmware_ranges(&data)?;
+        let data = if ranges.iter().any(|range| range.key_type <= 1) { data } else { Vec::new() };
+        Ok((!ranges.is_empty()).then(|| FirmwareFile { path: path.to_owned(), ranges, data }))
     }
 
     fn child(&self, inode: Inode, wanted: &str) -> Result<Option<u64>> {
@@ -428,15 +432,17 @@ impl Fs {
         self.finish(output)
     }
 
-    fn rewrite(&self, inode: Inode, old: &[u8], new: &[u8]) -> Result<Blob> {
+    fn rewrite(&self, inode: Inode, old: &[u8], new: &[u8], refs: &mut Option<Vec<Physical>>) -> Result<Blob> {
         if old.len() != new.len() || old.len() as u64 != inode.size { bail!("EROFS COW replacement size changed: {} != {}", new.len(), inode.size) }
         if old == new { return Ok(self.source.clone()) }
-        if self.fragments { return self.clone_plain(inode, new) }
-        let refs = self.references()?; let mut patches = Vec::new();
+        let clone = |refs: &mut Option<Vec<Physical>>| { *refs = None; self.clone_plain(inode, new) };
+        if self.fragments { return clone(refs) }
+        if refs.is_none() { *refs = Some(self.references()?) }
+        let mut patches = Vec::new();
         if matches!(inode.layout, PLAIN | INLINE) {
             for (physical, logical, len) in self.flat_ranges(inode)? {
                 if old[logical..logical + len] != new[logical..logical + len] {
-                    if !Self::exclusive(inode, physical, len, &refs)? { return self.clone_plain(inode, new) }
+                    if !Self::exclusive(inode, physical, len, refs.as_ref().unwrap())? { return clone(refs) }
                     diff(physical, &old[logical..logical + len], &new[logical..logical + len], &mut patches)
                 }
             }
@@ -445,11 +451,11 @@ impl Fs {
             while at < new.len() {
                 let extent = self.extent(inode, map, at)?; let range = extent.logical..extent.logical + extent.logical_len;
                 if old[range.clone()] != new[range.clone()] {
-                    if !Self::exclusive(inode, extent.physical, extent.physical_len, &refs)? { return self.clone_plain(inode, new) }
+                    if !Self::exclusive(inode, extent.physical, extent.physical_len, refs.as_ref().unwrap())? { return clone(refs) }
                     if extent.encoded {
-                        if extent.algorithm != 0 { return self.clone_plain(inode, new) }
+                        if extent.algorithm != 0 { return clone(refs) }
                         let encoded = block::compress(&new[range.clone()], Some(CompressionMode::HIGHCOMPRESSION(12)), false)?;
-                        if encoded.len() > extent.physical_len { return self.clone_plain(inode, new) }
+                        if encoded.len() > extent.physical_len { return clone(refs) }
                         let mut data = vec![0; extent.physical_len];
                         let at = if self.zero_padding { data.len() - encoded.len() } else { 0 }; data[at..at + encoded.len()].copy_from_slice(&encoded);
                         let decoded = block::decompress(&encoded, Some(extent.logical_len as i32))?;
@@ -481,7 +487,7 @@ impl Fs {
         }
         let inode = self.inode(target.with_context(|| format!("EROFS path not found: {path}"))?)?;
         if inode.mode & 0o170000 != 0o100000 { bail!("EROFS removal target is not a regular file: {path}") }
-        let output = self.rewrite(parent, &old, &new)?;
+        let output = self.rewrite(parent, &old, &new, &mut None)?;
         if Fs::open(output.clone())?.find_opt(path)?.is_some() { bail!("EROFS removal verification failed: {path}") }
         Ok(output)
     }
@@ -516,14 +522,26 @@ fn diff(base: u64, old: &[u8], new: &[u8], out: &mut Vec<(u64, Vec<u8>)>) {
 pub fn read(source: Blob, path: &str) -> Result<Vec<u8>> { let fs = Fs::open(source)?; let inode = fs.find(path)?; fs.read_inode(inode) }
 
 pub(super) fn signed_firmware(source: Blob) -> Result<Vec<FirmwareFile>> {
-    let fs = Fs::open(source)?; let mut out = Vec::new(); let mut seen = BTreeSet::new();
-    fs.signed_files(fs.root, "", &mut seen, &mut out)?; out.sort_by(|left, right| left.path.cmp(&right.path)); Ok(out)
+    let fs = Fs::open(source)?; let mut files = Vec::new();
+    fs.regular_files(fs.root, "", &mut BTreeSet::new(), &mut files)?;
+    let mut out = Vec::new();
+    par::ordered(files.len(), |index| fs.firmware(&files[index].0, files[index].1), |file| { out.extend(file); Ok(()) })?;
+    out.sort_by(|left, right| left.path.cmp(&right.path)); Ok(out)
 }
 
 pub fn replace(source: Blob, path: &str, data: &[u8]) -> Result<Blob> {
-    let fs = Fs::open(source)?; let inode = fs.find(path)?;
-    if inode.mode & 0o170000 != 0o100000 { bail!("EROFS target is not a regular file") }
-    let old = fs.read_inode(inode)?; fs.rewrite(inode, &old, data)
+    replace_all(source, &[(path.to_owned(), data.to_vec())])
+}
+
+pub fn replace_all(mut source: Blob, files: &[(String, Vec<u8>)]) -> Result<Blob> {
+    let mut refs = None;
+    for (path, data) in files {
+        let fs = Fs::open(source)?; let inode = fs.find(path)?;
+        if inode.mode & 0o170000 != 0o100000 { bail!("EROFS target is not a regular file") }
+        let old = fs.read_inode(inode)?;
+        source = fs.rewrite(inode, &old, data, &mut refs).with_context(|| format!("rewriting {path}"))?;
+    }
+    Ok(source)
 }
 
 pub fn remove(source: Blob, path: &str) -> Result<Blob> { Fs::open(source)?.unlink(path) }

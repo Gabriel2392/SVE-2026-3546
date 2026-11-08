@@ -1,14 +1,14 @@
-use std::{fs::{File, OpenOptions}, io::{Read, Write}, path::Path};
+use std::{fs::{File, OpenOptions}, io::{self, Read, Write}, path::Path, sync::{mpsc, Arc}, thread::{self, JoinHandle}};
 
 use anyhow::{bail, Context, Result};
-use lz4::{BlockMode, BlockSize, ContentChecksum, EncoderBuilder, liblz4::BlockChecksum};
 use md5::{Digest, Md5};
 
-use super::blob::Blob;
-use crate::io::Window;
+use super::{blob::Blob, lz4frame};
+use crate::io::{ReadAt, Window, write_all_at};
 
 const BLOCK: u64 = 512;
 const RECORD: u64 = 20 * BLOCK;
+const BUFFER: usize = 4 << 20;
 
 #[derive(Clone, Copy)]
 pub struct Meta { pub mode: u32, pub mtime: u64 }
@@ -56,101 +56,111 @@ fn header(name: &str, size: u64, meta: Meta, kind: u8) -> Result<[u8; 512]> {
     Ok(out)
 }
 
-struct Count(u64);
+struct At<'a> { file: &'a File, pos: u64, ready: Option<mpsc::Sender<u64>> }
 
-impl Write for Count {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.checked_add(data.len() as u64).ok_or(std::io::ErrorKind::FileTooLarge)?;
+impl Write for At<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        write_all_at(self.file, self.pos, data)?; self.pos += data.len() as u64;
+        if let Some(ready) = &self.ready { let _ = ready.send(self.pos); }
         Ok(data.len())
     }
-
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
-struct Hashed<'a> { file: &'a mut File, hash: &'a mut Md5, len: &'a mut u64 }
-
-impl Write for Hashed<'_> {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        crate::cancel::check()?;
-        let count = self.file.write(data)?;
-        self.hash.update(&data[..count]);
-        *self.len = self.len.checked_add(count as u64).ok_or(std::io::ErrorKind::FileTooLarge)?;
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> { self.file.flush() }
-}
-
-fn lz4<W: Write>(source: Blob, writer: W) -> Result<W> {
-    let source_size = source.len()?;
-    let mut builder = EncoderBuilder::new();
-    let block_size = if source_size <= 1 << 16 { BlockSize::Max64KB } else if source_size <= 1 << 18 { BlockSize::Max256KB } else { BlockSize::Max1MB };
-    builder.block_size(block_size).block_mode(BlockMode::Independent).block_checksum(BlockChecksum::NoBlockChecksum)
-        .checksum(ContentChecksum::ChecksumEnabled).content_size(source_size);
-    let mut encoder = builder.build(writer)?;
-    let mut reader = Window::new(source, 0, source_size)?;
-    let mut buffer = vec![0; 1 << 20];
-    loop {
-        crate::cancel::check()?;
-        let count = reader.read(&mut buffer)?;
-        if count == 0 { break }
-        encoder.write_all(&buffer[..count])?;
-    }
-    let (writer, result) = encoder.finish(); result?;
-    Ok(writer)
-}
-
-pub struct TarMd5 { file: File, hash: Md5, len: u64, tar_name: String }
+pub struct TarMd5 { file: Arc<File>, len: u64, tar_name: String, ready: Option<mpsc::Sender<u64>>, hasher: Option<JoinHandle<io::Result<Vec<u8>>>> }
 
 impl TarMd5 {
     pub fn create(path: &Path, tar_name: &str) -> Result<Self> {
-        let file = OpenOptions::new().write(true).create(true).truncate(true).open(path)
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)
             .with_context(|| format!("cannot create {}", path.display()))?;
-        Ok(Self { file, hash: Md5::new(), len: 0, tar_name: tar_name.to_owned() })
+        Ok(Self::new(file, tar_name))
     }
 
-    fn raw(&mut self, data: &[u8]) -> Result<()> {
-        let mut writer = Hashed { file: &mut self.file, hash: &mut self.hash, len: &mut self.len };
-        writer.write_all(data)?;
+    pub(super) fn new(file: File, tar_name: &str) -> Self {
+        let file = Arc::new(file);
+        let reader = file.clone();
+        let (ready, pending) = mpsc::channel::<u64>();
+        let hasher = thread::spawn(move || {
+            let mut hash = Md5::new(); let mut at = 0u64; let mut buffer = vec![0; BUFFER];
+            for end in pending {
+                while at < end {
+                    let count = buffer.len().min((end - at) as usize);
+                    reader.read_exact_at(at, &mut buffer[..count])?; hash.update(&buffer[..count]); at += count as u64;
+                }
+            }
+            Ok(hash.finalize().to_vec())
+        });
+        Self { file, len: 0, tar_name: tar_name.to_owned(), ready: Some(ready), hasher: Some(hasher) }
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        write_all_at(&self.file, self.len, data)?; self.len += data.len() as u64; Ok(())
+    }
+
+    fn mark(&self) { if let Some(ready) = &self.ready { let _ = ready.send(self.len); } }
+
+    fn pad(&mut self) -> Result<()> {
+        let padding = ((BLOCK - self.len % BLOCK) % BLOCK) as usize;
+        if padding != 0 { self.write(&[0; 512][..padding])? }
         Ok(())
+    }
+
+    pub(super) fn bytes(&mut self, data: &[u8]) -> Result<()> { self.write(data)?; self.mark(); Ok(()) }
+
+    pub(super) fn plain(&mut self, header: &[u8; 512], data: &[u8]) -> Result<()> {
+        self.write(header)?; self.write(data)?; self.pad()?; self.mark(); Ok(())
+    }
+
+    pub(super) fn copy(&mut self, source: &mut File, mut bytes: u64) -> Result<()> {
+        let mut buffer = vec![0; BUFFER];
+        while bytes != 0 {
+            crate::cancel::check()?;
+            let count = buffer.len().min(bytes as usize); source.read_exact(&mut buffer[..count])?; self.bytes(&buffer[..count])?; bytes -= count as u64;
+        }
+        Ok(())
+    }
+
+    pub(super) fn lz4_with(&mut self, header: impl FnOnce(u64) -> Result<[u8; 512]>, source: Blob) -> Result<u64> {
+        let at = self.len; let start = at + BLOCK;
+        let file = self.file.clone();
+        let known = lz4frame::known(&source);
+        let header = match known { Some(size) => { self.write(&header(size)?)?; self.mark(); None } None => Some(header) };
+        self.len = lz4frame::encode(source, At { file: &file, pos: start, ready: known.and(self.ready.clone()) })?.pos;
+        let size = self.len - start;
+        match header { Some(header) => write_all_at(&self.file, at, &header(size)?)?, None => if known != Some(size) { bail!("LZ4 member size changed while packing") } }
+        self.pad()?; self.mark();
+        Ok(size)
     }
 
     pub fn lz4(&mut self, name: &str, source: Blob, meta: Meta) -> Result<u64> {
         let member = format!("{name}.lz4");
-        let compressed = lz4(source.clone(), Count(0))?.0;
-        if compressed == 0 { bail!("LZ4 produced an empty tar member: {member}") }
-        self.raw(&header(&member, compressed, meta, b'0')?)?;
-        let before = self.len;
-        let writer = Hashed { file: &mut self.file, hash: &mut self.hash, len: &mut self.len };
-        let writer = lz4(source, writer)?;
-        if *writer.len - before != compressed { bail!("non-deterministic LZ4 size for {member}") }
-        drop(writer);
-        let padding = ((BLOCK - compressed % BLOCK) % BLOCK) as usize;
-        if padding != 0 { self.raw(&[0; 512][..padding])? }
-        Ok(compressed)
+        self.lz4_with(|size| header(&member, size, meta, b'0'), source)
     }
 
     pub fn member(&mut self, name: &str, source: Blob, meta: Meta, kind: u8) -> Result<()> {
         if !matches!(kind, 0 | b'0' | b'5') { bail!("unsupported tar member type for {name}") }
         let size = source.len()?;
         if kind == b'5' && size != 0 { bail!("directory has data: {name}") }
-        self.raw(&header(name, size, meta, kind)?)?;
-        let mut reader = Window::new(source, 0, size)?;
-        let mut writer = Hashed { file: &mut self.file, hash: &mut self.hash, len: &mut self.len };
-        std::io::copy(&mut reader, &mut writer)?;
-        let padding = ((BLOCK - size % BLOCK) % BLOCK) as usize;
-        if padding != 0 { self.raw(&[0; 512][..padding])? }
+        self.write(&header(name, size, meta, kind)?)?;
+        let mut reader = Window::new(source, 0, size)?; let mut buffer = vec![0; BUFFER];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 { break }
+            self.write(&buffer[..count])?;
+        }
+        self.pad()?; self.mark();
         Ok(())
     }
 
-
     pub fn finish(mut self) -> Result<()> {
-        self.raw(&[0; 1024])?;
+        self.write(&[0; 1024])?;
         let padding = ((RECORD - self.len % RECORD) % RECORD) as usize;
-        if padding != 0 { self.raw(&vec![0; padding])? }
-        let digest = hex::encode(self.hash.finalize());
-        self.file.write_all(format!("{digest}  {}\n", self.tar_name).as_bytes())?;
-        self.file.flush()?;
+        if padding != 0 { self.write(&vec![0; padding])? }
+        self.mark(); drop(self.ready.take());
+        let digest = self.hasher.take().context("MD5 worker is missing")?.join().map_err(|_| anyhow::anyhow!("MD5 worker panicked"))??;
+        let line = format!("{}  {}\n", hex::encode(digest), self.tar_name);
+        self.write(line.as_bytes())?;
+        self.file.sync_all()?;
         Ok(())
     }
 }

@@ -10,11 +10,10 @@ use std::{
 use anyhow::{bail, Context, Result};
 use twox_hash::XxHash32;
 
-use crate::{archive::{IndexedTarEntry, TarIndex}, io::{ReadAt, Region}};
+use crate::{archive::{IndexedTarEntry, TarIndex}, io::{ReadAt, Region}, par};
 use super::{archive::{Meta, TarMd5}, blob::Blob, incremental, sparse};
 
 const MAGIC: u32 = 0x184d_2204;
-const CACHE_BYTES: usize = 8 << 20;
 const MAX_BLOCKS: usize = 1 << 20;
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -30,49 +29,36 @@ struct Block {
     raw: bool,
 }
 
-struct Cache {
-    entries: VecDeque<(usize, Arc<Vec<u8>>)>,
-    bytes: usize,
-}
-
-impl Cache {
-    fn get(&mut self, index: usize) -> Option<Arc<Vec<u8>>> {
-        let at = self.entries.iter().position(|(stored, _)| *stored == index)?;
-        let value = self.entries.remove(at).unwrap();
-        let data = value.1.clone(); self.entries.push_front(value); Some(data)
-    }
-
-    fn insert(&mut self, index: usize, data: Arc<Vec<u8>>) {
-        while !self.entries.is_empty() && self.bytes.saturating_add(data.len()) > CACHE_BYTES {
-            self.bytes -= self.entries.pop_back().unwrap().1.len();
-        }
-        self.bytes += data.len(); self.entries.push_front((index, data));
-    }
-}
+type Slot = Arc<Mutex<Option<Arc<Vec<u8>>>>>;
 
 pub(super) struct FrameBlob {
     source: Arc<dyn ReadAt>,
     blocks: Vec<Block>,
     len: u64,
-    max_block: usize,
-    cache: Mutex<Cache>,
+    cache: Mutex<VecDeque<(usize, Slot)>>,
+    capacity: usize,
 }
 
 fn read_exact(source: &dyn ReadAt, at: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut data = vec![0; len]; source.read_exact_at(at, &mut data)?; Ok(data)
 }
 
-fn decode_block(source: &dyn ReadAt, block: Block, max_block: usize) -> io::Result<Vec<u8>> {
+fn decompress(encoded: &[u8], capacity: usize) -> io::Result<Vec<u8>> {
+    let mut decoded = vec![0; capacity];
+    let len = lz4::block::decompress_to_buffer(encoded, Some(capacity as i32), &mut decoded)
+        .map_err(|error| invalid(format!("invalid LZ4 block: {error}")))?;
+    decoded.truncate(len); Ok(decoded)
+}
+
+fn decode_block(source: &dyn ReadAt, block: Block) -> io::Result<Vec<u8>> {
     let encoded = read_exact(source, block.encoded, block.encoded_len)?;
     if block.raw {
         if encoded.len() != block.decoded_len { return Err(invalid("raw LZ4 block changed size")) }
         return Ok(encoded)
     }
-    let mut decoded = vec![0; max_block];
-    let len = lz4_flex::block::decompress_into(&encoded, &mut decoded)
-        .map_err(|error| invalid(format!("invalid LZ4 block: {error}")))?;
-    if len != block.decoded_len { return Err(invalid("LZ4 block decoded length changed")) }
-    decoded.truncate(len); Ok(decoded)
+    let decoded = decompress(&encoded, block.decoded_len)?;
+    if decoded.len() != block.decoded_len { return Err(invalid("LZ4 block decoded length changed")) }
+    Ok(decoded)
 }
 
 impl FrameBlob {
@@ -100,8 +86,7 @@ impl FrameBlob {
         let content_size = u64::from_le_bytes(header[6..14].try_into().unwrap());
 
         let block_checksum = flg & 0x10 != 0;
-        let mut blocks = Vec::new(); let mut physical = header_len as u64; let mut logical = 0u64;
-        let mut content_hash = XxHash32::with_seed(0);
+        let mut blocks = Vec::new(); let mut physical = header_len as u64;
         loop {
             if blocks.len() >= MAX_BLOCKS { bail!("LZ4 frame contains too many blocks") }
             let raw_size = u32::from_le_bytes(read_exact(source.as_ref(), physical, 4)?.try_into().unwrap()); physical += 4;
@@ -112,37 +97,48 @@ impl FrameBlob {
                 bail!("invalid LZ4 block length {encoded_len}")
             }
             if physical.checked_add(encoded_len as u64).filter(|&end| end <= source_len).is_none() { bail!("truncated LZ4 block") }
-            let encoded = read_exact(source.as_ref(), physical, encoded_len)?;
-            if block_checksum {
-                let expected = u32::from_le_bytes(read_exact(source.as_ref(), physical + encoded_len as u64, 4)?.try_into().unwrap());
-                if XxHash32::oneshot(0, &encoded) != expected { bail!("invalid LZ4 block checksum") }
-            }
-            let decoded = if raw { encoded.clone() } else {
-                let mut output = vec![0; max_block];
-                let len = lz4_flex::block::decompress_into(&encoded, &mut output)
-                    .map_err(|error| anyhow::anyhow!("invalid LZ4 block: {error}"))?;
-                output.truncate(len); output
-            };
-            if decoded.is_empty() || decoded.len() > max_block { bail!("invalid decoded LZ4 block length") }
-            content_hash.write(&decoded);
-            blocks.push(Block { encoded: physical, encoded_len, decoded: logical, decoded_len: decoded.len(), raw });
-            logical = logical.checked_add(decoded.len() as u64).context("LZ4 content size overflow")?;
+            blocks.push(Block { encoded: physical, encoded_len, decoded: 0, decoded_len: 0, raw });
             physical = physical.checked_add(encoded_len as u64 + if block_checksum { 4 } else { 0 }).context("LZ4 offset overflow")?;
         }
-        if logical != content_size { bail!("LZ4 content size mismatch: {logical} != {content_size}") }
         let expected = u32::from_le_bytes(read_exact(source.as_ref(), physical, 4)?.try_into().unwrap()); physical += 4;
-        if content_hash.finish() as u32 != expected { bail!("invalid LZ4 content checksum") }
         if physical != source_len { bail!("trailing data after LZ4 frame") }
-        Ok(Arc::new(Self {
-            source, blocks, len: logical, max_block,
-            cache: Mutex::new(Cache { entries: VecDeque::new(), bytes: 0 }),
-        }))
+        let mut content_hash = XxHash32::with_seed(0); let mut lens = Vec::with_capacity(blocks.len());
+        par::ordered(blocks.len(), |index| -> Result<Vec<u8>> {
+            let block = blocks[index];
+            let encoded = read_exact(source.as_ref(), block.encoded, block.encoded_len)?;
+            if block_checksum {
+                let expected = u32::from_le_bytes(read_exact(source.as_ref(), block.encoded + block.encoded_len as u64, 4)?.try_into().unwrap());
+                if XxHash32::oneshot(0, &encoded) != expected { bail!("invalid LZ4 block checksum") }
+            }
+            let decoded = if block.raw { encoded } else { decompress(&encoded, max_block)? };
+            if decoded.is_empty() || decoded.len() > max_block { bail!("invalid decoded LZ4 block length") }
+            Ok(decoded)
+        }, |decoded| { content_hash.write(&decoded); lens.push(decoded.len()); Ok(()) })?;
+        let mut logical = 0u64;
+        for (block, len) in blocks.iter_mut().zip(lens) {
+            block.decoded = logical; block.decoded_len = len;
+            logical = logical.checked_add(len as u64).context("LZ4 content size overflow")?;
+        }
+        if logical != content_size { bail!("LZ4 content size mismatch: {logical} != {content_size}") }
+        if content_hash.finish() as u32 != expected { bail!("invalid LZ4 content checksum") }
+        Ok(Arc::new(Self { source, blocks, len: logical, cache: Mutex::new(VecDeque::new()), capacity: ((par::threads() * (4 << 20)) / max_block).max(8) }))
     }
 
     fn block(&self, index: usize) -> io::Result<Arc<Vec<u8>>> {
-        if let Some(data) = self.cache.lock().unwrap_or_else(|error| error.into_inner()).get(index) { return Ok(data) }
-        let data = Arc::new(decode_block(self.source.as_ref(), self.blocks[index], self.max_block)?);
-        self.cache.lock().unwrap_or_else(|error| error.into_inner()).insert(index, data.clone()); Ok(data)
+        let slot = {
+            let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+            match cache.iter().position(|(stored, _)| *stored == index) {
+                Some(at) => { let entry = cache.remove(at).unwrap(); let slot = entry.1.clone(); cache.push_front(entry); slot }
+                None => {
+                    let slot = Slot::default(); cache.push_front((index, slot.clone()));
+                    cache.truncate(self.capacity); slot
+                }
+            }
+        };
+        let mut value = slot.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(data) = value.as_ref() { return Ok(data.clone()) }
+        let data = Arc::new(decode_block(self.source.as_ref(), self.blocks[index])?);
+        *value = Some(data.clone()); Ok(data)
     }
 }
 
@@ -171,7 +167,7 @@ pub(super) struct StockInput {
     metadata: BTreeMap<String, Meta>,
 }
 
-pub(super) trait ImageSource {
+pub(super) trait ImageSource: Sync {
     fn image(&self, name: &str) -> Result<Blob>;
 }
 
@@ -188,7 +184,7 @@ impl StockInput {
         let paths = [ap, cp, csc]; let mut kinds = BTreeSet::new(); let mut archives = Vec::new();
         for path in paths {
             let kind = archive_kind(path)?; if !kinds.insert(kind.clone()) { bail!("duplicate {kind} archive") }
-            incremental::parse_trailer(path).with_context(|| format!("validating Odin trailer for {}", path.display()))?;
+            incremental::check_later(path).with_context(|| format!("validating Odin trailer for {}", path.display()))?;
             let source: Arc<dyn ReadAt> = Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
             archives.push(TarIndex::open(source).with_context(|| format!("reading {}", path.display()))?);
         }
@@ -197,7 +193,7 @@ impl StockInput {
     }
 
     pub(super) fn single(path: &Path, names: impl IntoIterator<Item = String>) -> Result<Self> {
-        incremental::parse_trailer(path).with_context(|| format!("validating Odin trailer for {}", path.display()))?;
+        incremental::check_later(path).with_context(|| format!("validating Odin trailer for {}", path.display()))?;
         let source: Arc<dyn ReadAt> = Arc::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
         let index = TarIndex::open(source).with_context(|| format!("reading {}", path.display()))?;
         Self::load(vec![index], names)

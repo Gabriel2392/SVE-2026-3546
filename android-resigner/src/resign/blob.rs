@@ -1,6 +1,6 @@
 use std::{fs::File, io, path::Path, sync::Arc};
 
-use crate::io::{Bytes, ReadAt, Region};
+use crate::{io::{Bytes, ReadAt, Region}, par};
 
 pub type Blob = Arc<dyn ReadAt>;
 
@@ -101,19 +101,24 @@ pub fn overlay(source: Blob, mut changes: Vec<(u64, Blob)>) -> io::Result<Blob> 
     Concat::blob(parts)
 }
 
-pub fn hash_range<D: sha2_10::Digest + Default>(source: &dyn ReadAt, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+const CHUNK: u64 = 1 << 20;
+
+pub fn chunks(source: &dyn ReadAt, offset: u64, len: u64, mut consume: impl FnMut(&[u8])) -> io::Result<()> {
     let source_len = source.len()?;
     if offset.checked_add(len).is_none_or(|end| end > source_len) { return Err(io::ErrorKind::UnexpectedEof.into()) }
-    let mut digest = D::new();
-    let mut buffer = vec![0; 1 << 20];
-    let mut at = 0;
-    while at < len {
-        let count = buffer.len().min((len - at) as usize);
-        source.read_exact_at(offset + at, &mut buffer[..count])?;
-        digest.update(&buffer[..count]);
-        at += count as u64;
-    }
-    Ok(digest.finalize().to_vec())
+    par::ordered(len.div_ceil(CHUNK) as usize, |index| {
+        let at = index as u64 * CHUNK;
+        let mut data = vec![0; CHUNK.min(len - at) as usize];
+        source.read_exact_at(offset + at, &mut data)?; Ok(data)
+    }, |data| { consume(&data); Ok(()) })
+}
+
+pub fn hash_with<D: sha2_10::Digest>(mut digest: D, source: &dyn ReadAt, offset: u64, len: u64) -> io::Result<D> {
+    chunks(source, offset, len, |data| digest.update(data))?; Ok(digest)
+}
+
+pub fn hash_range<D: sha2_10::Digest + Default>(source: &dyn ReadAt, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    Ok(hash_with(D::new(), source, offset, len)?.finalize().to_vec())
 }
 
 pub fn hash<D: sha2_10::Digest + Default>(source: &dyn ReadAt, len: u64) -> io::Result<Vec<u8>> { hash_range::<D>(source, 0, len) }

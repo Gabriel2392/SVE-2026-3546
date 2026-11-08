@@ -1,8 +1,6 @@
 pub(super) struct ReedSolomon {
     roots: usize,
-    alpha: [u8; 256],
-    index: [u8; 256],
-    generator: Vec<u8>,
+    table: Vec<u8>,
 }
 
 impl ReedSolomon {
@@ -23,19 +21,29 @@ impl ReedSolomon {
             generator[0] = alpha[(index[generator[0] as usize] as usize + i) % 255];
         }
         for value in &mut generator { *value = index[*value as usize] }
-        Self { roots, alpha, index, generator }
-    }
-
-    pub(super) fn update(&self, byte: u8, parity: &mut [u8]) {
-        let feedback = self.index[(byte ^ parity[0]) as usize];
-        if feedback != 255 {
-            for j in 1..self.roots {
-                parity[j] ^= self.alpha[(feedback as usize + self.generator[self.roots - j] as usize) % 255];
+        let mut table = vec![0; 256 * roots];
+        for x in 1..256 {
+            for k in 0..roots {
+                table[x * roots + k] = alpha[(index[x] as usize + generator[roots - 1 - k] as usize) % 255];
             }
         }
-        parity.copy_within(1..self.roots, 0);
-        parity[self.roots - 1] = if feedback == 255 { 0 }
-            else { self.alpha[(feedback as usize + self.generator[0] as usize) % 255] };
+        Self { roots, table }
     }
 
+    pub(super) fn encode(&self, input: &[u8], parity: &mut [u8]) {
+        let roots = self.roots;
+        if roots == 2 {
+            for (&byte, pair) in input.iter().zip(parity.chunks_exact_mut(2)) {
+                let x = (byte ^ pair[0]) as usize * 2;
+                pair[0] = pair[1] ^ self.table[x]; pair[1] = self.table[x + 1];
+            }
+            return
+        }
+        for (&byte, row) in input.iter().zip(parity.chunks_exact_mut(roots)) {
+            let x = (byte ^ row[0]) as usize * roots;
+            let t = &self.table[x..x + roots];
+            for k in 0..roots - 1 { row[k] = row[k + 1] ^ t[k]; }
+            row[roots - 1] = t[roots - 1];
+        }
+    }
 }

@@ -3,7 +3,7 @@ use std::{io, sync::Arc};
 use anyhow::{bail, Context, Result};
 
 use super::blob::{self, Blob};
-use crate::io::ReadAt;
+use crate::{io::ReadAt, par};
 const MAGIC: u32 = 0xed26_ff3a;
 const RAW: u16 = 0xcac1;
 const FILL: u16 = 0xcac2;
@@ -95,23 +95,23 @@ pub fn encode(source: Blob, block: u32) -> Result<Blob> {
     let max_raw = ((u32::MAX as u64 - 12) / block as u64) as u32;
     let max_fill = (u32::MAX as u64 / block as u64) as u32;
     let mut chunks = Vec::<Chunk>::new();
-    let mut buffer = vec![0; 4 << 20];
-    let batch_blocks = (buffer.len() / block as usize).max(1);
+    let batch = ((1 << 20) / block as u64).max(1);
     let mut index = 0u64;
-    while index < total_blocks {
-        crate::cancel::check()?;
-        let count = batch_blocks.min((total_blocks - index) as usize);
-        let bytes = count * block as usize;
-        source.read_exact_at(index * block as u64, &mut buffer[..bytes])?;
-        for piece in buffer[..bytes].chunks_exact(block as usize) {
-            let kind = classify(piece);
+    par::ordered(total_blocks.div_ceil(batch) as usize, |task| -> io::Result<Vec<Kind>> {
+        let first = task as u64 * batch;
+        let mut data = vec![0; (batch.min(total_blocks - first) * block as u64) as usize];
+        source.read_exact_at(first * block as u64, &mut data)?;
+        Ok(data.chunks_exact(block as usize).map(classify).collect())
+    }, |kinds| {
+        for kind in kinds {
             let limit = if kind == Kind::Raw { max_raw } else { max_fill };
             if let Some(last) = chunks.last_mut().filter(|last| last.kind == kind && last.blocks < limit) {
                 last.blocks += 1;
             } else { chunks.push(Chunk { kind, start: index * block as u64, blocks: 1 }) }
             index += 1;
         }
-    }
+        Ok(())
+    })?;
     let mut header = Vec::with_capacity(28); header.extend_from_slice(&MAGIC.to_le_bytes()); header.extend_from_slice(&1u16.to_le_bytes()); header.extend_from_slice(&0u16.to_le_bytes());
     header.extend_from_slice(&28u16.to_le_bytes()); header.extend_from_slice(&12u16.to_le_bytes()); header.extend_from_slice(&block.to_le_bytes());
     header.extend_from_slice(&(total_blocks as u32).to_le_bytes()); header.extend_from_slice(&(chunks.len() as u32).to_le_bytes()); header.extend_from_slice(&0u32.to_le_bytes());

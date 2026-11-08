@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use p384::ecdsa::SigningKey;
 use sha2_10::{Digest, Sha512};
 
-use super::{blob::{self, Blob}, crypto::{self, Keys}};
+use super::{blob::{self, Blob}, crypto::{self, Keys}, lz4frame};
 const MARKER: &[u8] = b"SignerVer03";
 const INFO: usize = 0x100;
 const NAME: usize = 0x9c;
@@ -230,18 +230,6 @@ pub fn firmware_key_type(data: &[u8]) -> Option<u32> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirmwareRange { pub start: usize, pub end: usize, pub key_type: u32, pub key_index: u32 }
 
-impl FirmwareRange {
-    pub fn runtime(self, keys: &Keys) -> Self {
-        if self.key_type <= 1 { Self { key_type: 2, key_index: key_index(&keys.ree), ..self } } else { self }
-    }
-
-    pub fn repo(self, keys: &Keys) -> bool { self.key_type == 2 && self.key_index == key_index(&keys.ree) }
-}
-
-pub fn runtime_layout(ranges: &[FirmwareRange], keys: &Keys) -> Vec<FirmwareRange> {
-    ranges.iter().map(|range| range.runtime(keys)).collect()
-}
-
 fn checked_end(start: usize, count: usize, size: usize, limit: usize) -> Result<usize> {
     start.checked_add(count.checked_mul(size).context("ELF table size overflow")?)
         .filter(|&end| end <= limit).context("ELF table exceeds file")
@@ -380,30 +368,11 @@ fn sign_range(data: &mut [u8], range: FirmwareRange, keys: &Keys, description: &
     Ok(())
 }
 
-pub fn sign_firmware(data: &mut [u8], keys: &Keys, description: &str) -> Result<Vec<FirmwareRange>> {
-    let before = firmware_ranges(data)?;
-    if before.is_empty() { bail!("no valid CodeSigner firmware in {description}") }
-    for &range in &before { if range.key_type <= 1 { sign_range(data, range, keys, description)?; } }
-    let after = verify_firmware(data, keys, description)?;
-    if runtime_layout(&before, keys) != after { bail!("CodeSigner firmware layout changed in {description}") }
-    Ok(before)
-}
-
-pub fn verify_firmware(data: &[u8], keys: &Keys, description: &str) -> Result<Vec<FirmwareRange>> {
-    let ranges = firmware_ranges(data)?;
+pub fn sign_firmware(data: &mut [u8], ranges: &[FirmwareRange], keys: &Keys, description: &str) -> Result<bool> {
     if ranges.is_empty() { bail!("no valid CodeSigner firmware in {description}") }
-    for range in &ranges {
-        let key = if range.key_type <= 1 { keys.st2(range.key_type)? }
-            else if range.repo(keys) { &keys.ree } else { continue };
-        let footer = range.end - FOOTER;
-        if le32(data, footer + 12)? != key_index(key) { bail!("CodeSigner key index mismatch for {description}") }
-        let signature_at = range.end - EXCLUDED;
-        let digest = Sha512::digest(&data[range.start..signature_at]);
-        if !crypto::verify_padded(key.verifying_key(), &digest, &data[signature_at..signature_at + SIGNATURE]) {
-            bail!("CodeSigner signature does not match the selected {} key for {description}", if range.key_type == 0 { "TEE" } else { "REE" })
-        }
-    }
-    Ok(ranges)
+    let mut signed = false;
+    for &range in ranges { if range.key_type <= 1 { sign_range(data, range, keys, description)?; signed = true } }
+    Ok(signed)
 }
 
 pub fn sparse_template(source: &Blob) -> Result<Vec<u8>> {
@@ -460,16 +429,27 @@ fn sparse_layout(source: Blob, signer: Vec<u8>) -> Result<Blob> {
     }
 }
 
+pub fn stage_sparse(raw: Blob, template_block: &[u8], filename: &str, keys: &Keys) -> Result<Blob> {
+    let key_type = le32(template_block, 8)?;
+    let mut block = sparse_block(template_block, filename, key_type, key_index(keys.st2(key_type)?))?;
+    block[HEADER..HEADER + SIGNATURE].copy_from_slice(&template_block[HEADER..HEADER + SIGNATURE]);
+    Ok(blob::patch(raw, vec![(0, block)])?)
+}
+
 pub fn sign_sparse(source: Blob, template_block: &[u8], filename: &str, keys: &Keys) -> Result<Blob> {
     let key_type = le32(template_block, 8)?;
     let key = keys.st2(key_type)?;
     let unsigned = sparse_layout(source, sparse_block(template_block, filename, key_type, key_index(key))?)?;
     if unsigned.len()? < SPARSE_INFO { bail!("sparse image is too small for CodeSigner") }
-    let payload = blob::hash_range::<Sha512>(unsigned.as_ref(), SPARSE_INFO, unsigned.len()? - SPARSE_INFO)?;
+    let mut hash = Sha512::new();
+    let sizes = lz4frame::digest_sized(unsigned.as_ref(), SPARSE_INFO, |data| hash.update(data))?;
+    let payload = hash.finalize();
     let mut header = [0; HEADER];
     unsigned.read_exact_at(0x28, &mut header)?;
     let digest = Sha512::digest([payload.as_slice(), &header].concat());
     let signature = crypto::padded_signature(key, &digest)?;
     if !crypto::verify_padded(key.verifying_key(), &digest, &signature) { bail!("sparse CodeSigner signature self-verification failed") }
-    Ok(blob::patch(unsigned, vec![(SPARSE_SIGNATURE, signature.to_vec())])?)
+    let signed = blob::patch(unsigned, vec![(SPARSE_SIGNATURE, signature.to_vec())])?;
+    lz4frame::remember(&signed, sizes)?;
+    Ok(signed)
 }

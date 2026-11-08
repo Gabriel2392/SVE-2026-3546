@@ -267,9 +267,9 @@ fn patch_newc(
         .collect::<BTreeSet<_>>();
     let list = entries(&data)?;
     let mut found = BTreeSet::new();
-    let mut changed = Vec::new();
+    let mut signed_files = 0;
 
-    for (index, entry) in list.iter().enumerate() {
+    for entry in &list {
         let Some(name) = entry.name.as_ref() else {
             continue;
         };
@@ -285,11 +285,7 @@ fn patch_newc(
             continue;
         }
 
-        let ranges = codesigner::sign_firmware(
-            &mut data[entry.data.clone()],
-            keys,
-            &format!("{description}:{name}"),
-        )?;
+        codesigner::sign_firmware(&mut data[entry.data.clone()], &ranges, keys, &format!("{description}:{name}"))?;
         let signed = ranges.iter().filter(|range| range.key_type <= 1).collect::<Vec<_>>();
         if configured { found.insert(name.clone()); }
         if signed.is_empty() { continue }
@@ -301,31 +297,14 @@ fn patch_newc(
                 .copy_from_slice(format!("{checksum:08x}").as_bytes());
         }
         for range in &signed {
-            eprintln!("CodeSigned {description}:{name} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
+            log!("CodeSigned {description}:{name} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
         }
-        changed.push((index, ranges));
-    }
-
-    let updated = entries(&data)?;
-    if updated.len() != list.len() {
-        bail!("{description}: newc entry set changed while signing firmware")
-    }
-    for (index, ranges) in &changed {
-        let entry = &updated[*index];
-        let name = entry.name.as_deref().unwrap_or("<non-UTF8>");
-        let actual = codesigner::verify_firmware(
-            &data[entry.data.clone()],
-            keys,
-            &format!("{description}:{name}"),
-        )?;
-        if actual != codesigner::runtime_layout(ranges, keys) {
-            bail!("{description}:{name}: CodeSigner layout changed during rebuild")
-        }
+        signed_files += 1;
     }
 
     Ok(PatchResult {
         data,
-        signed: changed.len(),
+        signed: signed_files,
         found,
     })
 }

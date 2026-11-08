@@ -63,8 +63,13 @@ pub(super) struct SourceHashes {
 }
 
 impl SourceHashes {
-    pub(super) fn from_paths(bl: &Path, ap: &Path, cp: &Path, csc: &Path) -> Result<Self> {
-        Ok(Self { bl: sha256_file(bl)?, ap: sha256_file(ap)?, cp: sha256_file(cp)?, csc: sha256_file(csc)? })
+    pub(super) fn spawn(bl: &Path, ap: &Path, cp: &Path, csc: &Path) -> std::thread::JoinHandle<Result<Self>> {
+        let paths = [bl, ap, cp, csc].map(Path::to_path_buf);
+        std::thread::spawn(move || std::thread::scope(|scope| {
+            let [bl, ap, cp, csc] = paths.each_ref().map(|path| scope.spawn(move || sha256_file(path)));
+            let join = |job: std::thread::ScopedJoinHandle<Result<String>>| job.join().map_err(|_| anyhow::anyhow!("SHA-256 worker panicked"))?;
+            Ok(Self { bl: join(bl)?, ap: join(ap)?, cp: join(cp)?, csc: join(csc)? })
+        }))
     }
 
     pub(super) fn from_unified(bl: &Path, archive: &Path) -> Result<Self> {
@@ -241,7 +246,7 @@ struct StockData {
     config_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fw_key_sha256: Option<String>,
-    sources: SourceHashes,
+    sources: Option<SourceHashes>,
     images: BTreeMap<String, ImageRecord>,
     logical: BTreeMap<String, ImageRecord>,
 }
@@ -259,7 +264,7 @@ pub(super) struct Stock { data: StockData }
 
 impl Stock {
     pub(super) fn new(soc: impl Into<String>, firmware: impl Into<String>, rollback: u32,
-                      config_sha256: impl Into<String>, sources: SourceHashes) -> Result<Self> {
+                      config_sha256: impl Into<String>, sources: Option<SourceHashes>) -> Result<Self> {
         let stock = Self { data: StockData {
             soc: soc.into(), firmware: firmware.into(), rollback,
             config_sha256: config_sha256.into(), fw_key_sha256: None, sources,
@@ -287,10 +292,17 @@ impl Stock {
         template.signer_info(filename)
     }
     pub(super) fn has(&self, name: &str) -> bool { self.data.images.contains_key(name) || self.data.logical.contains_key(name) }
-    pub(super) fn generated_salt(&self, partition: &str) -> [u8; 32] {
+    pub(super) fn generated_salt(&self, partition: &str) -> Result<[u8; 32]> {
+        let sources = self.data.sources.as_ref().context("stock source hashes are not ready")?;
         let mut hash = Sha256::new(); hash.update(b"android-resigner-avb-v1\0");
         hash.update(self.data.firmware.as_bytes()); hash.update([0]); hash.update(partition.as_bytes());
-        hash.update([0]); hash.update(self.data.sources.ap.as_bytes()); hash.finalize().into()
+        hash.update([0]); hash.update(sources.ap.as_bytes()); Ok(hash.finalize().into())
+    }
+
+    pub(super) fn set_sources(&mut self, value: SourceHashes) -> Result<()> {
+        let old = self.data.sources.replace(value);
+        if let Err(error) = self.validate(false) { self.data.sources = old; return Err(error) }
+        Ok(())
     }
 
     pub(super) fn insert_image(&mut self, name: impl Into<String>, record: ImageRecord) -> Result<()> {
@@ -320,8 +332,9 @@ impl Stock {
 
     pub(super) fn set_bl_source(&mut self, value: String) -> Result<()> {
         if !valid_digest(&value) { bail!("invalid BL source SHA-256") }
-        let old = std::mem::replace(&mut self.data.sources.bl, value);
-        if let Err(error) = self.validate(false) { self.data.sources.bl = old; return Err(error) }
+        let sources = self.data.sources.as_mut().context("stock source hashes are not ready")?;
+        let old = std::mem::replace(&mut sources.bl, value);
+        if let Err(error) = self.validate(false) { self.data.sources.as_mut().unwrap().bl = old; return Err(error) }
         Ok(())
     }
 
@@ -380,7 +393,7 @@ impl Stock {
     }
 
     pub(super) fn from_archive(path: &Path) -> Result<Option<Self>> {
-        incremental::parse_trailer(path)?;
+        incremental::check_later(path)?;
         let source: Arc<dyn ReadAt> = Arc::new(File::open(path)?);
         let index = TarIndex::open(source).with_context(|| format!("reading {}", path.display()))?;
         let found = index.entries().iter().filter(|entry| entry.name == MEMBER).collect::<Vec<_>>();
@@ -400,7 +413,11 @@ impl Stock {
         if self.data.fw_key_sha256.as_ref().is_some_and(|value| !valid_digest(value)) {
             bail!("invalid stock fw_key identity")
         }
-        self.data.sources.validate()?;
+        match &self.data.sources {
+            Some(sources) => sources.validate()?,
+            None if require_images => bail!("stock source hashes are missing"),
+            None => {}
+        }
         let count = self.data.images.len().checked_add(self.data.logical.len()).context("stock record count overflow")?;
         if count > MAX_RECORDS || (require_images && self.data.images.is_empty()) { bail!("invalid stock record count") }
         let mut names = BTreeSet::new(); let mut signer = None;

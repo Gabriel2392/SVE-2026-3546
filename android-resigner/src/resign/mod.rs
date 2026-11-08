@@ -1,3 +1,5 @@
+macro_rules! log { ($($arg:tt)*) => { crate::resign::log(format!($($arg)*)) } }
+
 mod archive;
 mod aosp;
 mod android;
@@ -14,6 +16,7 @@ mod graph;
 mod independent;
 mod incremental;
 mod input;
+mod lz4frame;
 mod stock;
 mod publish;
 mod ramdisk;
@@ -106,7 +109,7 @@ pub struct UpdateApOptions {
 }
 
 fn derive_stock(cfg_raw: &[u8], cfg: &Config, src: &StockInput, bl: &Path,
-                hashes: SourceHashes, generated: bool) -> Result<Stock> {
+                hashes: Option<SourceHashes>, generated: bool) -> Result<Stock> {
     let main = cfg.android.vbmeta.last().context("vbmeta.img is not configured")?;
     let img = src.image(main)?;
     let code = codesigner::extract(&img, img.len()?)?;
@@ -163,11 +166,12 @@ pub fn sign_image(o: SignImageOptions) -> Result<PathBuf> {
         let main = cfg.android.vbmeta.last().context("vbmeta.img is not configured")?;
         src = codesigner::ensure_signer_info(src, p.signer_info(main, &o.name)?)?;
     }
-    eprintln!("Signing {}", o.name);
+    log!("Signing {}", o.name);
     let built = independent::sign(&o.name, src, &p, rule, &Keys::load(&root, &cfg.signing)?, &cfg.android.avb_generation)?;
     let key = built.metadata.code_key;
+    incremental::checked()?;
     write_blob(built.image, &o.input, &o.output, o.force)?;
-    if let Some(key) = key { eprintln!("CodeSigned {} ({})", o.name, if key == 0 { "TEE" } else { "REE" }); }
+    if let Some(key) = key { log!("CodeSigned {} ({})", o.name, if key == 0 { "TEE" } else { "REE" }); }
     Ok(o.output)
 }
 
@@ -187,6 +191,7 @@ pub fn build_vbmeta(o: BuildVbmetaOptions) -> Result<PathBuf> {
     }
     let built = vbmeta_build::build(&cfg, &p, &keys, &src)?;
     if built.descriptors.is_empty() { bail!("no AVB descriptors were built") }
+    incremental::checked()?;
     if o.output.exists() && !o.force { bail!("output already exists: {}", o.output.display()) }
     let parent = output_parent(&o.output);
     fs::create_dir_all(parent)?;
@@ -240,6 +245,12 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     let (raw, cfg) = load_config(&root, o.soc)?;
     cfg.validate_image_rules()?;
     let keys = Keys::load(&root, &cfg.signing)?;
+    let scratch = output_parent(&o.output);
+    if o.aosp_zip.is_some() {
+        fs::create_dir_all(scratch).with_context(|| format!("creating output directory {}", scratch.display()))?;
+    }
+    let skip = o.logical.keys().filter_map(|name| image_name(&cfg.android.logical_rules, name).ok()).collect();
+    let aosp_job = o.aosp_zip.clone().map(|path| aosp::spawn(path, scratch.to_owned(), skip));
     let names = cfg.android.archive.iter().chain(&cfg.android.vbmeta).cloned().collect::<Vec<_>>();
     let mut base = StockInput::single(&o.base, names)?;
     let mut stock = if let Some(stock) = Stock::from_archive(&o.base)? {
@@ -247,7 +258,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     } else {
         let bl = o.bl.as_deref().context("archive has no android-resigner.json; pass --bl once")?;
         let hashes = SourceHashes::from_unified(bl, &o.base)?;
-        derive_stock(&raw, &cfg, &base, bl, hashes, true)?
+        derive_stock(&raw, &cfg, &base, bl, Some(hashes), true)?
     };
     stock.require_config(&raw)?;
     if stock.soc() != cfg.soc { bail!("saved signing data uses a different SoC") }
@@ -289,11 +300,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         stock.replace_images(records)?;
         stock.set_bl_source(bl_hash)?;
     }
-    let scratch = output_parent(&o.output);
-    if o.aosp_zip.is_some() {
-        fs::create_dir_all(scratch).with_context(|| format!("creating output directory {}", scratch.display()))?;
-    }
-    let aosp = o.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path, scratch)).transpose()?;
+    let (aosp, mut decoded) = match aosp_job.map(join).transpose()? { Some((zip, images)) => (Some(zip), images), None => (None, BTreeMap::new()) };
     let aosp_catalog = if aosp.is_some() {
         let catalog = Catalog::open(o.bl.as_deref().context("update-ap --aosp-zip requires --bl")?)?;
         catalog.require_firmware_key(&keys)?;
@@ -319,7 +326,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
             let capacity = avb::minimum_capacity(avb::IntegrityKind::Hashtree, layout.size, &cfg.android.avb_generation.avb())?;
             stock.set_logical(&name, ImageRecord::new(&rule.partition, capacity, None, None))?;
             if !logical.contains_key(&name) {
-                let image = aosp.logical(&name)?.with_context(|| format!("AOSP ZIP has no image for {name}"))?;
+                let image = decoded.remove(&name).with_context(|| format!("AOSP ZIP has no image for {name}"))?;
                 logical.insert(name, image.image);
             }
         }
@@ -350,10 +357,10 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
     for (name, image) in physical {
         let rule = &cfg.android.image_rules[&name];
         let built = if wrappers.contains(&name) {
-            independent::wrap(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)?
+            independent::wrap(&name, image, &stock, rule, &keys, &cfg.android.avb_generation, false)?
         } else { independent::sign(&name, image, &stock, rule, &keys, &cfg.android.avb_generation)? };
         if let Some(key) = built.metadata.code_key {
-            eprintln!("CodeSigned {name} ({})", if key == 0 { "TEE" } else { "REE" });
+            log!("CodeSigned {name} ({})", if key == 0 { "TEE" } else { "REE" });
         }
         signed_physical.insert(name, built.image);
     }
@@ -394,7 +401,7 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
                 leaves.insert(name, value);
             }
         } else {
-            let updated = android::update_super(&cfg, &base, &stock, &keys, &signed_logical)?;
+            let updated = android::update_super(&cfg, &base, &stock, &keys, &signed_logical, false)?;
             changed.insert(super_name.clone(), updated.image.clone());
             sources.clear();
             for (name, (image, descriptor)) in updated.logical {
@@ -444,6 +451,22 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
         for name in &archive.members { println!("  {name}") }
     }
     Ok(ap)
+}
+
+thread_local! { static CAPTURE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) }; }
+
+pub(crate) fn log(line: String) {
+    CAPTURE.with_borrow_mut(|capture| match capture { Some(lines) => lines.push(line), None => eprintln!("{line}") })
+}
+
+fn capture<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+    CAPTURE.set(Some(Vec::new()));
+    let value = run();
+    (value, CAPTURE.take().unwrap_or_default())
+}
+
+fn join<T>(job: std::thread::JoinHandle<Result<T>>) -> Result<T> {
+    job.join().map_err(|_| anyhow::anyhow!("worker thread panicked"))?
 }
 
 fn write_blob(src: blob::Blob, input: &Path, out: &Path, force: bool) -> Result<()> {
@@ -593,13 +616,15 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
     }
 
     let requested = config.android.archive.iter().chain(&config.android.vbmeta).cloned().collect::<Vec<_>>();
-    eprintln!("Mapping firmware");
+    log!("Mapping firmware");
+    let skip = options.logical.keys().filter_map(|name| image_name(&config.android.logical_rules, name).ok()).collect();
+    let aosp_job = options.aosp_zip.clone().map(|path| aosp::spawn(path, parent.to_owned(), skip));
+    let mut hashes = Some(SourceHashes::spawn(bl, &options.ap, &options.cp, &options.csc));
     let mut input = StockInput::open(&options.ap, &options.cp, &options.csc, requested)?;
-    let hashes = SourceHashes::from_paths(bl, &options.ap, &options.cp, &options.csc)?;
-    let mut stock = derive_stock(&cfg_raw, &config, &input, bl, hashes, true)?;
+    let mut stock = derive_stock(&cfg_raw, &config, &input, bl, None, true)?;
     stock.require_config(&cfg_raw)?;
     if stock.soc() != config.soc { bail!("saved signing data uses a different SoC") }
-    let aosp = options.aosp_zip.as_ref().map(|path| aosp::AospZip::open(path, parent)).transpose()?;
+    let (aosp, mut decoded) = match aosp_job.map(join).transpose()? { Some((zip, images)) => (Some(zip), images), None => (None, BTreeMap::new()) };
     let aosp_catalog = if aosp.is_some() { Some(Catalog::open(bl)?) } else { None };
     if aosp.is_some() && options.super_image.is_some() { bail!("--super cannot be combined with --aosp-zip") }
     let mut paths = options.images;
@@ -629,7 +654,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
             let capacity = avb::minimum_capacity(avb::IntegrityKind::Hashtree, layout.size, &config.android.avb_generation.avb())?;
             stock.set_logical(&name, ImageRecord::new(&rule.partition, capacity, None, None))?;
             if !logical.contains_key(&name) {
-                let image = aosp.logical(&name)?.with_context(|| format!("AOSP ZIP has no image for {name}"))?;
+                let image = decoded.remove(&name).with_context(|| format!("AOSP ZIP has no image for {name}"))?;
                 if image.size != layout.size { bail!("AOSP logical size mismatch for {name}") }
                 logical.insert(name, image.image);
             }
@@ -642,11 +667,12 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
         }
     }
     if !logical.is_empty() && physical.contains_key(&config.android.super_image) { bail!("super and logical replacements cannot be combined") }
-    eprintln!("Signing images");
+    if !physical.is_empty() || !logical.is_empty() { if let Some(job) = hashes.take() { stock.set_sources(join(job)?)?; } }
+    log!("Signing images");
     for (name, source) in physical {
         let rule = &config.android.image_rules[&name];
         if rule.codesigner == config::CodeSignerKind::StandaloneVbmeta { bail!("standalone vbmeta is regenerated: {name}") }
-        let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation)?;
+        let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation, true)?;
         if built.partition != rule.partition || matches!(rule.avb, config::AvbKind::Hash | config::AvbKind::Hashtree) && built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
         input.replace(&name, built.image)?;
     }
@@ -656,7 +682,7 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
         for (name, source) in logical {
             let rule = &config.android.logical_rules[&name];
             let source = codesigner::ensure_signer_info(source, stock.signer_info(main_vbmeta, &name)?)?;
-            let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation)?;
+            let built = independent::wrap(&name, source, &stock, rule, &keys, &config.android.avb_generation, true)?;
             if built.partition != rule.partition || built.descriptor.is_none() { bail!("{name} has the wrong partition or AVB data after signing") }
             signed.insert(name, built.image);
         }
@@ -671,12 +697,11 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
             if !signed.is_empty() { bail!("unexpected signed AOSP logical images: {:?}", signed.keys().collect::<Vec<_>>()) }
             let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, targets)?;
             if super_image.metadata.device_size() != android::super_device_size(&input, &config)? { bail!("AOSP super device size differs from stock super") }
-            let sparse = sparse::encode(super_image.raw, 4096)?;
             let seed = aosp_catalog.as_ref().context("AOSP catalog is missing")?.sparse_seed(config.android.st2_key_type, 4096)?;
-            let image = codesigner::sign_sparse(sparse, &seed, &config.android.super_image, &keys)?;
+            let image = codesigner::stage_sparse(super_image.raw, &seed, &config.android.super_image, &keys)?;
             input.replace(&config.android.super_image, image)?;
         } else {
-            let updated = android::update_super(&config, &input, &stock, &keys, &signed)?;
+            let updated = android::update_super(&config, &input, &stock, &keys, &signed, true)?;
             input.replace(&config.android.super_image, updated.image)?;
         }
     }
@@ -688,19 +713,20 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
 
     let partial = Partial::create(&output)?;
     let output_name = output.file_name().and_then(|name| name.to_str()).context("output filename is not UTF-8")?;
-    eprintln!("Packing {output_name}");
+    log!("Packing {output_name}");
     let tar_name = output_name.strip_suffix(".md5").unwrap_or(output_name);
     let mut tar = TarMd5::create(&partial.path, tar_name)?;
+    if let Some(job) = hashes.take() { stock.set_sources(join(job)?)?; }
     let data = Some((stock::MEMBER.to_owned(), blob::bytes(stock.encode()?)));
     let names = config.android.archive.iter().chain(&config.android.vbmeta).cloned().collect::<Vec<_>>();
     input.pack(&mut tar, &mut built.images, &names, data)?;
     tar.finish()?;
-    fs::OpenOptions::new().read(true).open(&partial.path)?.sync_all()?;
+    incremental::checked()?;
     if let Some(bl) = options.bl {
         if publish::contains(&bl, &main)? {
             let bl_output = options.bl_output.unwrap_or_else(|| bl.clone());
             let bl_name = bl_output.file_name().and_then(|name| name.to_str()).unwrap_or("BL_RESIGNED.tar.md5").to_owned();
-            eprintln!("Updating {bl_name}");
+            log!("Updating {bl_name}");
             let in_place = bl == bl_output
                 || bl.canonicalize().ok().as_ref() == bl_output.canonicalize().ok().as_ref();
             let copy = backup(&bl_output)?;

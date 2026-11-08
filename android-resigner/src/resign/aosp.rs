@@ -5,6 +5,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    thread::{self, JoinHandle},
 };
 
 use anyhow::{bail, Context, Result};
@@ -16,7 +17,7 @@ const BLOCK: u64 = 4096;
 const MAX_SMALL: u64 = 64 << 20;
 const MAX_LIST: u64 = 8 << 20;
 const MAX_DIRECT: u64 = 512 << 20;
-const MEMORY_LIMIT: u64 = 4 << 30;
+const MEMORY_LIMIT: u64 = 1 << 30;
 const MAX_IMAGE: u64 = 16 << 30;
 const MAX_TOTAL_NEW: u64 = 16 << 30;
 const RANGE_LIMIT: usize = 262_144;
@@ -163,6 +164,22 @@ fn dynamic(data: &[u8]) -> Result<DynamicLayout> {
         if size > groups[&group] { bail!("dynamic partitions exceed group {group}") }
     }
     Ok(DynamicLayout { groups, partitions })
+}
+
+pub(super) fn spawn(path: PathBuf, scratch: PathBuf, skip: BTreeSet<String>) -> JoinHandle<Result<(AospZip, BTreeMap<String, AospImage>)>> {
+    thread::spawn(move || {
+        let zip = AospZip::open(&path, &scratch)?;
+        let images = thread::scope(|scope| {
+            let jobs = zip.layout.partitions.keys().map(|part| format!("{part}.img")).filter(|name| !skip.contains(name))
+                .map(|name| { let zip = &zip; let job = scope.spawn({ let name = name.clone(); move || zip.logical(&name) }); (name, job) })
+                .collect::<Vec<_>>();
+            jobs.into_iter().map(|(name, job)| {
+                let image = job.join().map_err(|_| anyhow::anyhow!("AOSP decoder panicked"))??.with_context(|| format!("AOSP ZIP has no image for {name}"))?;
+                Ok((name, image))
+            }).collect::<Result<BTreeMap<_, _>>>()
+        })?;
+        Ok((zip, images))
+    })
 }
 
 impl AospZip {

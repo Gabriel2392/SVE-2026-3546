@@ -435,6 +435,8 @@ fn run() -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, 2); }
     if let Err(error) = android_resigner::cancel::install() {
         eprintln!("Error: installing signal handlers: {error}");
         return ExitCode::FAILURE

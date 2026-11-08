@@ -28,7 +28,7 @@ pub(super) struct PublishResult {
 }
 
 fn images_in(path: &PathBuf, names: &BTreeSet<String>) -> Result<BTreeSet<String>> {
-    incremental::parse_trailer(path)?;
+    incremental::check_later(path)?;
     let source: Arc<dyn ReadAt> = Arc::new(File::open(path)?);
     let index = TarIndex::open(source).with_context(|| format!("reading {}", path.display()))?;
     let mut found = BTreeSet::new();
@@ -81,6 +81,7 @@ pub(super) fn publish(options: Options) -> Result<PublishResult> {
     }
     let missing = names.difference(&used).cloned().collect::<Vec<_>>();
     if !missing.is_empty() { bail!("rebuilt images are absent from every output archive: {missing:?}") }
+    incremental::checked()?;
     let mut backups = Vec::new();
     for (index, item) in ready.iter().enumerate() {
         let output = item.output();

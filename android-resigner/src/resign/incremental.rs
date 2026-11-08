@@ -1,20 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::Mutex,
+    thread::{self, JoinHandle},
+    time::SystemTime,
 };
 
 use anyhow::{bail, Context, Result};
-use lz4::{BlockMode, BlockSize, ContentChecksum, EncoderBuilder, liblz4::BlockChecksum};
 use md5::{Digest, Md5};
 
-use crate::{archive::safe_path, io::Window};
-use super::blob::Blob;
+use crate::archive::safe_path;
+use super::{archive::TarMd5, blob::Blob};
 
 const BLOCK: u64 = 512;
 const RECORD: u64 = 20 * BLOCK;
-const BUFFER: usize = 1 << 20;
+const BUFFER: usize = 8 << 20;
 const LZ4_MAGIC: [u8; 4] = 0x184d_2204u32.to_le_bytes();
 
 pub(super) struct UpdateOptions {
@@ -139,7 +141,9 @@ fn plain_header(name: &str, size: u64) -> Result<[u8; 512]> {
     replace_size(header, size)
 }
 
-pub(super) fn parse_trailer(path: &Path) -> Result<(u64, String)> {
+struct Trailer { tar_size: u64, hash_size: u64, archive: String, md5: String }
+
+fn trailer(path: &Path) -> Result<Trailer> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let size = file.metadata()?.len();
     let tail_size = size.min(4096) as usize;
@@ -177,98 +181,72 @@ pub(super) fn parse_trailer(path: &Path) -> Result<(u64, String)> {
         (line_offset, line_offset)
     };
     if tar_size == 0 || tar_size % RECORD != 0 { bail!("Odin TAR length is not record-aligned") }
-    file.rewind()?;
+    Ok(Trailer { tar_size, hash_size, archive: archive.to_owned(), md5: std::str::from_utf8(&line[..32])?.to_owned() })
+}
+
+fn md5(path: &Path, size: u64, expected: &str) -> Result<()> {
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hash = Md5::new();
-    let mut left = hash_size; let mut buffer = vec![0; BUFFER];
+    let mut left = size; let mut buffer = vec![0; BUFFER];
     while left != 0 {
         crate::cancel::check()?;
         let count = buffer.len().min(left as usize); file.read_exact(&mut buffer[..count])?; hash.update(&buffer[..count]); left -= count as u64;
     }
-    if !hex::encode(hash.finalize()).eq_ignore_ascii_case(std::str::from_utf8(&line[..32])?) { bail!("invalid Odin TAR MD5") }
-    Ok((tar_size, archive.to_owned()))
+    if !hex::encode(hash.finalize()).eq_ignore_ascii_case(expected) { bail!("invalid Odin TAR MD5") }
+    Ok(())
 }
 
-struct Count(u64);
+type Key = (PathBuf, u64, SystemTime);
 
-impl Write for Count {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.checked_add(data.len() as u64).ok_or(std::io::ErrorKind::FileTooLarge)?; Ok(data.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+static VERIFIED: Mutex<Vec<Key>> = Mutex::new(Vec::new());
+static PENDING: Mutex<Vec<(Key, JoinHandle<Result<()>>)>> = Mutex::new(Vec::new());
+
+fn key(path: &Path) -> Result<Key> {
+    let meta = fs::metadata(path).with_context(|| format!("opening {}", path.display()))?;
+    Ok((fs::canonicalize(path)?, meta.len(), meta.modified()?))
 }
 
-fn lz4<W: Write>(source: Blob, writer: W) -> Result<W> {
-    let size = source.len()?;
-    let block = if size <= 1 << 16 { BlockSize::Max64KB } else if size <= 1 << 18 { BlockSize::Max256KB } else { BlockSize::Max1MB };
-    let mut builder = EncoderBuilder::new();
-    builder.block_size(block).block_mode(BlockMode::Independent).block_checksum(BlockChecksum::NoBlockChecksum)
-        .checksum(ContentChecksum::ChecksumEnabled).content_size(size);
-    let mut encoder = builder.build(writer)?;
-    let mut reader = Window::new(source, 0, size)?; let mut buffer = vec![0; BUFFER];
-    loop {
-        crate::cancel::check()?;
-        let count = reader.read(&mut buffer)?; if count == 0 { break }
-        encoder.write_all(&buffer[..count])?;
-    }
-    let (writer, result) = encoder.finish(); result?; Ok(writer)
+fn join(handle: JoinHandle<Result<()>>) -> Result<()> { handle.join().map_err(|_| anyhow::anyhow!("MD5 worker panicked"))? }
+
+fn verified(key: &Key) -> Result<bool> {
+    let handle = {
+        let mut pending = PENDING.lock().unwrap_or_else(|error| error.into_inner());
+        pending.iter().position(|(item, _)| item == key).map(|at| pending.remove(at).1)
+    };
+    if let Some(handle) = handle { join(handle)?; VERIFIED.lock().unwrap_or_else(|error| error.into_inner()).push(key.clone()); }
+    Ok(VERIFIED.lock().unwrap_or_else(|error| error.into_inner()).contains(key))
 }
 
-struct Output { file: File, hash: Md5, len: u64, tar_name: String }
-
-impl Output {
-    fn create(path: &Path, tar_name: String) -> Result<Self> {
-        let file = OpenOptions::new().create_new(true).write(true).open(path).with_context(|| format!("creating {}", path.display()))?;
-        Ok(Self { file, hash: Md5::new(), len: 0, tar_name })
+pub(super) fn parse_trailer(path: &Path) -> Result<(u64, String)> {
+    let value = trailer(path)?; let key = key(path)?;
+    if !verified(&key)? {
+        md5(path, value.hash_size, &value.md5)?;
+        VERIFIED.lock().unwrap_or_else(|error| error.into_inner()).push(key);
     }
+    Ok((value.tar_size, value.archive))
+}
 
-    fn bytes(&mut self, data: &[u8]) -> Result<()> {
-        self.file.write_all(data)?; self.hash.update(data); self.len = self.len.checked_add(data.len() as u64).context("output archive too large")?; Ok(())
+pub(super) fn check_later(path: &Path) -> Result<(u64, String)> {
+    let value = trailer(path)?; let key = key(path)?;
+    let mut pending = PENDING.lock().unwrap_or_else(|error| error.into_inner());
+    if !VERIFIED.lock().unwrap_or_else(|error| error.into_inner()).contains(&key) && !pending.iter().any(|(item, _)| item == &key) {
+        let (path, size, expected) = (path.to_owned(), value.hash_size, value.md5);
+        let handle = thread::spawn(move || md5(&path, size, &expected).with_context(|| format!("validating Odin trailer for {}", path.display())));
+        pending.push((key, handle));
     }
+    Ok((value.tar_size, value.archive))
+}
 
-    fn copy(&mut self, source: &mut File, mut bytes: u64) -> Result<()> {
-        let mut buffer = vec![0; BUFFER];
-        while bytes != 0 {
-            crate::cancel::check()?;
-            let count = buffer.len().min(bytes as usize); source.read_exact(&mut buffer[..count])?; self.bytes(&buffer[..count])?; bytes -= count as u64;
+pub(super) fn checked() -> Result<()> {
+    let pending = std::mem::take(&mut *PENDING.lock().unwrap_or_else(|error| error.into_inner()));
+    let mut result = Ok(());
+    for (key, handle) in pending {
+        match join(handle) {
+            Ok(()) => VERIFIED.lock().unwrap_or_else(|error| error.into_inner()).push(key),
+            Err(error) => if result.is_ok() { result = Err(error) },
         }
-        Ok(())
     }
-
-    fn compressed(&mut self, header: [u8; 512], source: Blob) -> Result<()> {
-        let size = lz4(source.clone(), Count(0))?.0;
-        if size == 0 { bail!("LZ4 produced an empty member") }
-        self.bytes(&replace_size(header, size)?)?;
-        let before = self.len;
-        struct Writer<'a>(&'a mut Output);
-        impl Write for Writer<'_> {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.bytes(data).map_err(std::io::Error::other)?; Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { self.0.file.flush() }
-        }
-        lz4(source, Writer(self))?;
-        if self.len - before != size { bail!("non-deterministic LZ4 size") }
-        let padding = (BLOCK - size % BLOCK) % BLOCK;
-        if padding != 0 { self.bytes(&[0; 512][..padding as usize])? }
-        Ok(())
-    }
-
-    fn plain(&mut self, header: [u8; 512], data: &[u8]) -> Result<()> {
-        self.bytes(&replace_size(header, data.len() as u64)?)?; self.bytes(data)?;
-        let padding = (BLOCK - data.len() as u64 % BLOCK) % BLOCK;
-        if padding != 0 { self.bytes(&[0; 512][..padding as usize])? }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<()> {
-        self.bytes(&[0; 1024])?;
-        let padding = (RECORD - self.len % RECORD) % RECORD;
-        if padding != 0 { self.bytes(&vec![0; padding as usize])? }
-        let digest = hex::encode(self.hash.finalize());
-        self.file.write_all(format!("{digest}  {}\n", self.tar_name).as_bytes())?;
-        self.file.sync_all()?;
-        Ok(())
-    }
+    result
 }
 
 struct Partial { path: PathBuf, keep: bool }
@@ -296,7 +274,7 @@ pub(super) fn stage(options: UpdateOptions) -> Result<Staged> {
         || options.base.canonicalize().ok().as_ref() == options.output.canonicalize().ok().as_ref();
     if in_place && options.incremental { bail!("incremental output must not overwrite the base AP archive") }
     if options.output.exists() && !options.force { bail!("output already exists: {}", options.output.display()) }
-    let (tar_size, _) = parse_trailer(&options.base)?;
+    let (tar_size, _) = check_later(&options.base)?;
     let mut replacements = options.changed;
     for (name, image) in options.dependencies {
         if replacements.insert(name.clone(), image).is_some() { bail!("dependent image {name:?} is supplied twice") }
@@ -310,7 +288,8 @@ pub(super) fn stage(options: UpdateOptions) -> Result<Staged> {
     let mut seen = BTreeSet::new(); let mut paths = BTreeSet::new(); let mut emitted = Vec::new();
     let mut input = File::open(&options.base)?; let mut at = 0u64;
     let temporary = partial(&options.output)?;
-    let mut output = Output::create(&temporary.path, output_tar_name(&options.output)?)?;
+    let file = OpenOptions::new().create_new(true).read(true).write(true).open(&temporary.path).with_context(|| format!("creating {}", temporary.path.display()))?;
+    let mut output = TarMd5::new(file, &output_tar_name(&options.output)?);
     let mut zero_blocks = 0usize;
     while at + BLOCK <= tar_size {
         let mut header = [0; 512]; input.read_exact(&mut header)?; at += BLOCK;
@@ -337,9 +316,9 @@ pub(super) fn stage(options: UpdateOptions) -> Result<Staged> {
         let include = !options.incremental || selected.contains(&member) || plain_data.is_some();
         if include {
             if let Some(source) = replacement {
-                output.compressed(header, source)?; emitted.push(decoded.unwrap().to_owned());
+                output.lz4_with(|size| replace_size(header, size), source)?; emitted.push(decoded.unwrap().to_owned());
             } else if let Some(data) = plain_data {
-                output.plain(header, data)?;
+                output.plain(&replace_size(header, data.len() as u64)?, data)?;
             } else {
                 output.bytes(&header)?; output.copy(&mut input, padded)?;
                 at += padded; continue
@@ -360,7 +339,7 @@ pub(super) fn stage(options: UpdateOptions) -> Result<Staged> {
     if let Some((name, data)) = plain {
         if !seen.contains(&name) {
             if paths.contains(&safe_path(&name)?) { bail!("plain member path conflicts with an existing member: {name}") }
-            output.plain(plain_header(&name, data.len() as u64)?, &data)?;
+            output.plain(&plain_header(&name, data.len() as u64)?, &data)?;
         }
     }
     output.finish()?;

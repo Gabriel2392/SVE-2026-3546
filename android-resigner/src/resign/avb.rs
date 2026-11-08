@@ -379,9 +379,7 @@ fn with_extras(template: &Parsed, replacement: Descriptor, keys: &Keys) -> Resul
 
 fn hash_with_salt(source: &dyn ReadAt, size: u64, salt: &[u8]) -> Result<Vec<u8>> {
     let mut hash = Sha256::new(); hash.update(salt);
-    let mut buffer = vec![0; 1 << 20]; let mut at = 0;
-    while at < size { let count = buffer.len().min((size - at) as usize); source.read_exact_at(at, &mut buffer[..count])?; hash.update(&buffer[..count]); at += count as u64; }
-    Ok(hash.finalize().to_vec())
+    Ok(blob::hash_with(hash, source, 0, size)?.finalize().to_vec())
 }
 
 fn wrap(payload: Blob, original: u64, descriptor: Descriptor, template: &Parsed, keys: &Keys, integrity: Vec<Vec<u8>>) -> Result<(Blob, Descriptor)> {
@@ -417,6 +415,18 @@ pub fn add_hash_footer(payload: Blob, template: &Parsed, keys: &Keys) -> Result<
     wrap(payload, size, updated, template, keys, vec![])
 }
 
+fn hash_level(read: impl Fn(u64, &mut [u8]) -> std::io::Result<()> + Sync, size: u64, block: u64, salt: &Sha256) -> Result<Vec<u8>> {
+    let per = ((1 << 20) / block).max(1);
+    let mut output = Vec::with_capacity((size / block * 32) as usize);
+    crate::par::ordered((size / block).div_ceil(per) as usize, |index| -> std::io::Result<Vec<u8>> {
+        let start = index as u64 * per * block;
+        let mut data = vec![0; (per * block).min(size - start) as usize];
+        read(start, &mut data)?;
+        Ok(data.chunks(block as usize).flat_map(|piece| { let mut hash = salt.clone(); hash.update(piece); hash.finalize() }).collect())
+    }, |digests| { output.extend_from_slice(&digests); Ok(()) })?;
+    Ok(output)
+}
+
 fn hash_tree(source: &dyn ReadAt, size: u64, block: u64, salt: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     if block == 0 || !block.is_power_of_two() || size == 0 || size % block != 0 { bail!("invalid AVB hashtree geometry") }
     let digest_slot = 32u64;
@@ -427,40 +437,41 @@ fn hash_tree(source: &dyn ReadAt, size: u64, block: u64, salt: &[u8]) -> Result<
     let mut offsets = Vec::with_capacity(level_sizes.len());
     for index in 0..level_sizes.len() { offsets.push(level_sizes[index + 1..].iter().sum::<u64>()); }
     let mut tree = vec![0; usize::try_from(tree_size).context("AVB hashtree exceeds memory")?];
-    let mut input_size = size; let mut buffer = vec![0; block as usize]; let mut last = Vec::new();
+    let mut salted = Sha256::new(); salted.update(salt);
+    let mut input_size = size; let mut last = Vec::new();
     for level in 0..level_sizes.len() {
-        let mut output = Vec::with_capacity(level_sizes[level] as usize);
-        let mut at = 0;
-        while at < input_size {
-            let count = block.min(input_size - at) as usize; buffer.fill(0);
-            if level == 0 { source.read_exact_at(at, &mut buffer[..count])? } else { let start = offsets[level - 1] + at; buffer[..count].copy_from_slice(&tree[start as usize..start as usize + count]); }
-            let mut hash = Sha256::new(); hash.update(salt); hash.update(&buffer); output.extend_from_slice(&hash.finalize()); at += count as u64;
-        }
+        let mut output = if level == 0 { hash_level(|at, data| source.read_exact_at(at, data), input_size, block, &salted)? } else {
+            let start = offsets[level - 1] as usize; let previous = &tree[start..start + input_size as usize];
+            hash_level(|at, data| { data.copy_from_slice(&previous[at as usize..at as usize + data.len()]); Ok(()) }, input_size, block, &salted)?
+        };
         output.resize(level_sizes[level] as usize, 0); let target = offsets[level] as usize; tree[target..target + output.len()].copy_from_slice(&output); last = output; input_size = level_sizes[level];
     }
-    let mut root = Sha256::new(); root.update(salt); root.update(&last); Ok((root.finalize().to_vec(), tree))
+    let mut root = salted; root.update(&last); Ok((root.finalize().to_vec(), tree))
 }
 
 fn fec(source: &dyn ReadAt, size: u64, block: u64, roots: usize) -> Result<Vec<u8>> {
     if block != 4096 || roots == 0 || roots >= 255 || size % block != 0 { bail!("invalid AVB FEC geometry") }
-    let rsn = 255 - roots;
+    let rsn = 255 - roots as u64;
     let blocks = size / block;
-    let rounds = blocks.div_ceil(rsn as u64);
+    let rounds = blocks.div_ceil(rsn);
     let output_size = rounds.checked_mul(roots as u64).and_then(|value| value.checked_mul(block)).context("AVB FEC size overflow")?;
     let code = super::fec::ReedSolomon::new(roots);
-    let mut input = vec![0; block as usize];
     let mut output = vec![0; usize::try_from(output_size).context("AVB FEC exceeds memory")?];
-    for column in 0..rsn as u64 {
-        crate::cancel::check()?;
-        for round in 0..rounds {
-            let index = column * rounds + round;
-            if index < blocks { source.read_exact_at(index * block, &mut input)? } else { input.fill(0) }
-            let at = round as usize * roots * block as usize;
-            for (row, &byte) in input.iter().enumerate() {
-                code.update(byte, &mut output[at + row * roots..at + (row + 1) * roots]);
-            }
+    let per = rounds.div_ceil(crate::par::threads() as u64 * 8).clamp(1, 64);
+    let stride = per as usize * roots * block as usize;
+    crate::par::for_each(output.chunks_mut(stride).enumerate().collect(), |(task, parity): (usize, &mut [u8])| -> Result<()> {
+        let first = task as u64 * per; let count = (parity.len() / (roots * block as usize)) as u64;
+        let mut input = vec![0; (count * block) as usize];
+        for column in 0..rsn {
+            crate::cancel::check()?;
+            let start = column * rounds + first;
+            let present = blocks.saturating_sub(start).min(count);
+            input.fill(0);
+            source.read_exact_at(start * block, &mut input[..(present * block) as usize])?;
+            code.encode(&input, parity);
         }
-    }
+        Ok(())
+    })?;
     Ok(output)
 }
 

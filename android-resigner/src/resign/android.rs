@@ -80,7 +80,7 @@ fn leaf(image: &Blob, rule: &ImageRule) -> Result<avb::Descriptor> {
 }
 
 pub(super) fn update_super(config: &Config, source: &dyn ImageSource, stock: &Stock, keys: &Keys,
-                           replacements: &BTreeMap<String, Blob>) -> Result<UpdatedSuper> {
+                           replacements: &BTreeMap<String, Blob>, stage: bool) -> Result<UpdatedSuper> {
     let input = Input::open(source, config)?;
     let plans = input.metadata.plans(None)?;
     let mut by_partition = BTreeMap::new();
@@ -131,7 +131,8 @@ pub(super) fn update_super(config: &Config, source: &dyn ImageSource, stock: &St
     };
     seed = template.sparse_seed(4096)?;
     let raw = blob::overlay(blob::zeroes(input.metadata.device_size()), overlays)?;
-    let image = codesigner::sign_sparse(sparse::encode(raw, 4096)?, &seed, &config.android.super_image, keys)?;
+    let image = if stage { codesigner::stage_sparse(raw, &seed, &config.android.super_image, keys)? }
+        else { codesigner::sign_sparse(sparse::encode(raw, 4096)?, &seed, &config.android.super_image, keys)? };
     let mut logical = BTreeMap::new();
     for (name, rule) in &config.android.logical_rules {
         if rule.optional && !images.contains_key(&rule.partition) { continue }
@@ -152,7 +153,7 @@ fn logical(config: &Config, stock: Blob, name: &str, keys: &Keys) -> Result<(Blo
 
     let mut payload = blob::region(stock.clone(), 0, data_size(integrity)?)?;
     if let Some(rules) = rules {
-        eprintln!("Processing {name} for firmware files");
+        log!("Processing {name} for firmware files");
         if rules.discover_firmware && f2fs::present(&payload)? {
             if !rules.preserve_stock.is_empty() || !rules.sign_firmware.is_empty() || !rules.remove.is_empty() {
                 bail!("{name}: explicit file edits are unsupported on the F2FS discovery path")
@@ -166,36 +167,26 @@ fn logical(config: &Config, stock: Blob, name: &str, keys: &Keys) -> Result<(Blo
         for path in &rules.remove {
             payload = erofs::remove(payload, path).with_context(|| format!("removing {name}:/{path}"))?;
         }
-        let mut firmware = rules.sign_firmware.iter().cloned().collect::<BTreeSet<_>>();
         let detected = if rules.discover_firmware {
-            let files = erofs::signed_firmware(payload.clone()).with_context(|| format!("discovering signed firmware in {name}"))?;
-            firmware.extend(files.iter().map(|file| file.path.clone())); files
+            erofs::signed_firmware(payload.clone()).with_context(|| format!("discovering signed firmware in {name}"))?
         } else { Vec::new() };
-        for path in &firmware {
-            let mut data = erofs::read(payload.clone(), path).with_context(|| format!("reading {name}:/{path}"))?;
-            let original = data.clone();
-            let ranges = codesigner::sign_firmware(&mut data, keys, &format!("/{name}/{path}"))?;
-            for range in ranges.iter().filter(|range| range.key_type == 2) {
-                if data[range.start..range.end] != original[range.start..range.end] {
-                    bail!("{name}:{path}: type 2 firmware changed")
-                }
-            }
-            payload = erofs::replace(payload, path, &data).with_context(|| format!("COW signing {name}:/{path}"))?;
-            for range in ranges.iter().filter(|range| range.key_type <= 1) {
-                eprintln!("CodeSigned {name}:{path} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
-            }
+        let mut firmware = detected.into_iter().map(|file| (file.path, (file.ranges, file.data))).collect::<BTreeMap<_, _>>();
+        for path in &rules.sign_firmware {
+            if firmware.contains_key(path) { continue }
+            let data = erofs::read(payload.clone(), path).with_context(|| format!("reading {name}:/{path}"))?;
+            firmware.insert(path.clone(), (codesigner::firmware_ranges(&data)?, data));
         }
-        if rules.discover_firmware {
-            let after = erofs::signed_firmware(payload.clone()).with_context(|| format!("verifying signed firmware in rebuilt {name}"))?;
-            if after.len() != detected.len() || detected.iter().zip(&after).any(|(old, new)| {
-                old.path != new.path || codesigner::runtime_layout(&old.ranges, keys) != new.ranges
-            }) { bail!("{name}: signed firmware set changed during rebuild: before={detected:?}, after={after:?}") }
-            for file in &after {
-                let data = erofs::read(payload.clone(), &file.path)?;
-                if codesigner::verify_firmware(&data, keys, &format!("/{name}/{}", file.path))? != file.ranges {
-                    bail!("{name}: CodeSigner verification changed ranges for {}", file.path)
-                }
+        let mut changed = Vec::new();
+        for (path, (ranges, mut data)) in firmware {
+            if !codesigner::sign_firmware(&mut data, &ranges, keys, &format!("/{name}/{path}"))? { continue }
+            for range in ranges.iter().filter(|range| range.key_type <= 1) {
+                log!("CodeSigned {name}:{path} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
             }
+            changed.push((path, data));
+        }
+        payload = erofs::replace_all(payload, &changed).with_context(|| format!("COW signing {name}"))?;
+        for (path, data) in &changed {
+            if erofs::read(payload.clone(), path)? != *data { bail!("{name}:{path}: rewritten firmware does not match") }
         }
         }
     }
@@ -238,7 +229,7 @@ fn super_image(config: &Config, source: &dyn ImageSource, keys: &Keys, catalog: 
         bail!("{} build ID mismatch: {signer_id} is not in {build_id}", config.android.super_image)
     }
     let super_image = codesigner::sign_sparse(sparse, &signer, &config.android.super_image, keys)?;
-    eprintln!("CodeSigned {} ({})", config.android.super_image, mode(template.key_type()?));
+    log!("CodeSigned {} ({})", config.android.super_image, mode(template.key_type()?));
     Ok(SuperBuilt { image: super_image, descriptors })
 }
 
@@ -258,7 +249,7 @@ fn physical(source: &dyn ImageSource, name: &str, rule: &ImageRule, keys: &Keys,
             (raw, Some(descriptor))
         } else { (raw, None) };
         let image = codesigner::sign_sparse(sparse::encode(raw, 4096)?, &signer, name, keys)?;
-        eprintln!("CodeSigned {name} ({})", mode(codesigner::Template::from_sparse_seed(&signer)?.key_type()?));
+        log!("CodeSigned {name} ({})", mode(codesigner::Template::from_sparse_seed(&signer)?.key_type()?));
         return Ok((image, descriptor))
     }
     if rule.codesigner != CodeSignerKind::Normal { bail!("{name}: physical image requires normal or sparse CodeSigner") }
@@ -276,11 +267,11 @@ fn physical(source: &dyn ImageSource, name: &str, rule: &ImageRule, keys: &Keys,
     }
     let mut payload = blob::region(stock, 0, payload_size)?;
     if let Some(ramdisk) = &rule.ramdisk {
-        eprintln!("Processing {name} for firmware files");
+        log!("Processing {name} for firmware files");
         payload = boot::repack(payload, ramdisk, keys, name)?;
     }
     let signed = codesigner::append(payload, &code, name, keys)?;
-    eprintln!("CodeSigned {name} ({})", mode(code.key_type()?));
+    log!("CodeSigned {name} ({})", mode(code.key_type()?));
     if let Some(template) = template { let (image, descriptor) = avb::add_footer(signed, &template, keys)?; Ok((image, Some(descriptor))) }
     else { Ok((signed, None)) }
 }
@@ -296,7 +287,7 @@ fn vbmeta(input: &dyn ImageSource, name: &str, replacements: &BTreeMap<String, a
     let parsed = avb::parse(source)?;
     let encoded = avb::standalone(&parsed, replacements, targets, managed, keys)?;
     let image = codesigner::append_vbmeta(encoded, &code, name, keys)?;
-    eprintln!("CodeSigned {name} ({})", mode(code.key_type()?));
+    log!("CodeSigned {name} ({})", mode(code.key_type()?));
     Ok(image)
 }
 
@@ -311,14 +302,22 @@ pub(super) fn build(config: &Config, input: &dyn ImageSource, keys: &Keys, bl: O
             bail!("BL/AP firmware mismatch: BL {}, AP {build_id}", catalog.version())
         }
     }
-    let built_super = super_image(config, input, keys, catalog.as_ref(), &build_id)?; let mut descriptors = built_super.descriptors; let mut images = BTreeMap::new();
+    let (built_super, (physicals, lines)) = std::thread::scope(|scope| {
+        let job = scope.spawn(|| super::capture(|| config.android.archive.iter().filter(|name| *name != &config.android.super_image).map(|name| {
+            let rule = config.android.image_rules.get(name).with_context(|| format!("missing image rule for {name}"))?;
+            let (image, descriptor) = physical(input, name, rule, keys, catalog.as_ref(), &build_id)
+                .with_context(|| format!("processing physical image {name}"))?;
+            Ok((name.clone(), image, descriptor))
+        }).collect::<Result<Vec<_>>>()));
+        let built_super = super_image(config, input, keys, catalog.as_ref(), &build_id);
+        (built_super, job.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+    });
+    let built_super = built_super?; let mut descriptors = built_super.descriptors; let mut images = BTreeMap::new();
     images.insert(config.android.super_image.clone(), built_super.image);
-    for name in config.android.archive.iter().filter(|name| *name != &config.android.super_image) {
-        let rule = config.android.image_rules.get(name).with_context(|| format!("missing image rule for {name}"))?;
-        let (image, descriptor) = physical(input, name, rule, keys, catalog.as_ref(), &build_id)
-            .with_context(|| format!("processing physical image {name}"))?;
+    for line in lines { super::log(line) }
+    for (name, image, descriptor) in physicals? {
         if let Some(descriptor) = descriptor { let partition = descriptor.name()?.context("physical AVB descriptor has no partition name")?; if descriptors.insert(partition.clone(), descriptor).is_some() { bail!("duplicate signed descriptor {partition}") } }
-        images.insert(name.clone(), image);
+        images.insert(name, image);
     }
     let managed = config.android.image_rules.values().chain(config.android.logical_rules.values()).map(|rule| rule.partition.clone()).collect::<BTreeSet<_>>();
     for name in &config.android.vbmeta {

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
 
@@ -23,7 +23,7 @@ impl AvbGenerationPolicy {
 
     fn salt(&self, stock: &Stock, partition: &str) -> Result<[u8; 32]> {
         match &self.salt {
-            SaltPolicy::Stock => Ok(stock.generated_salt(partition)),
+            SaltPolicy::Stock => stock.generated_salt(partition),
             SaltPolicy::Zero => Ok([0; 32]),
             SaltPolicy::Fixed { hex } => {
                 let raw = hex::decode(hex).context("invalid fixed AVB salt")?;
@@ -153,7 +153,7 @@ fn avb_payload(source: Blob, boundary: Option<u64>) -> Result<Blob> {
 }
 
 fn resign_filesystem(mut payload: Blob, rule: &Filesystem, keys: &Keys, description: &str) -> Result<(Blob, usize)> {
-    eprintln!("Processing {description} for firmware files");
+    log!("Processing {description} for firmware files");
     if f2fs::present(&payload)? {
         if !rule.preserve_stock.is_empty() || !rule.sign_firmware.is_empty() || !rule.remove.is_empty() {
             bail!("explicit file edits are unsupported for independent F2FS signing")
@@ -162,40 +162,25 @@ fn resign_filesystem(mut payload: Blob, rule: &Filesystem, keys: &Keys, descript
     }
     if !rule.preserve_stock.is_empty() { bail!("independent signing cannot preserve files without a separate stock filesystem") }
     for path in &rule.remove { payload = erofs::remove(payload, path)?; }
-    let mut firmware = rule.sign_firmware.iter().cloned().collect::<BTreeSet<_>>();
-    let detected = if rule.discover_firmware {
-        let value = erofs::signed_firmware(payload.clone())?; firmware.extend(value.iter().map(|file| file.path.clone())); value
-    } else { Vec::new() };
-    let mut signed = 0;
-    for path in &firmware {
-        let mut data = erofs::read(payload.clone(), path)?;
-        let original = data.clone();
-        let ranges = codesigner::sign_firmware(&mut data, keys, &format!("{description}:/{path}"))?;
-        if codesigner::verify_firmware(&data, keys, &format!("{description}:/{path}"))?
-            != codesigner::runtime_layout(&ranges, keys) {
-            bail!("{description}:/{path}: CodeSigner verification changed ranges")
-        }
-        for range in ranges.iter().filter(|range| range.key_type == 2) {
-            if data[range.start..range.end] != original[range.start..range.end] {
-                bail!("{description}:/{path}: type 2 firmware changed")
-            }
-        }
-        payload = erofs::replace(payload, path, &data)?;
+    let detected = if rule.discover_firmware { erofs::signed_firmware(payload.clone())? } else { Vec::new() };
+    let mut firmware = detected.into_iter().map(|file| (file.path, (file.ranges, file.data))).collect::<BTreeMap<_, _>>();
+    for path in &rule.sign_firmware {
+        if firmware.contains_key(path) { continue }
+        let data = erofs::read(payload.clone(), path)?;
+        firmware.insert(path.clone(), (codesigner::firmware_ranges(&data)?, data));
+    }
+    let mut signed = 0; let mut changed = Vec::new();
+    for (path, (ranges, mut data)) in firmware {
+        if !codesigner::sign_firmware(&mut data, &ranges, keys, &format!("{description}:/{path}"))? { continue }
         for range in ranges.iter().filter(|range| range.key_type <= 1) {
-            eprintln!("CodeSigned {description}:{path} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
+            log!("CodeSigned {description}:{path} ({})", if range.key_type == 0 { "TEE" } else { "REE" });
             signed += 1;
         }
+        changed.push((path, data));
     }
-    if rule.discover_firmware {
-        let after = erofs::signed_firmware(payload.clone())?;
-        if after.len() != detected.len() || detected.iter().zip(&after).any(|(old, new)| {
-            old.path != new.path || codesigner::runtime_layout(&old.ranges, keys) != new.ranges
-        }) { bail!("signed EROFS firmware set changed during independent signing") }
-        for file in &after {
-            if codesigner::verify_firmware(&erofs::read(payload.clone(), &file.path)?, keys, &format!("{description}:/{}", file.path))? != file.ranges {
-                bail!("{description}:/{}: CodeSigner verification changed ranges", file.path)
-            }
-        }
+    payload = erofs::replace_all(payload, &changed)?;
+    for (path, data) in &changed {
+        if erofs::read(payload.clone(), path)? != *data { bail!("{description}:/{path}: rewritten firmware does not match") }
     }
     Ok((payload, signed))
 }
@@ -226,7 +211,7 @@ fn sign_normal(name: &str, source: Blob, stock: &Stock, record: &ImageRecord,
     let raw_end = if present { boundary.checked_sub(codesigner::NORMAL as u64).context("CodeSigner boundary underflow")? } else { boundary };
     let mut payload = blob::region(source, 0, raw_end)?;
     if nested && let Some(ramdisk) = &rule.ramdisk {
-        eprintln!("Processing {name} for firmware files");
+        log!("Processing {name} for firmware files");
         payload = boot::repack(payload, ramdisk, keys, name)?;
     }
     if nested && let Some(filesystem) = &rule.filesystem {
@@ -251,7 +236,7 @@ fn sign_without_codesigner(name: &str, source: Blob, stock: &Stock, record: &Ima
 }
 
 fn sign_sparse(name: &str, source: Blob, stock: &Stock, record: &ImageRecord,
-               rule: &ImageRule, keys: &Keys, policy: &AvbGenerationPolicy, nested: bool) -> Result<SignedImage> {
+               rule: &ImageRule, keys: &Keys, policy: &AvbGenerationPolicy, nested: bool, stage: bool) -> Result<SignedImage> {
     let mut metadata = BuildMetadata::default();
     let raw = sparse::decode_if_sparse(source)?;
     let seed = sparse_seed(&raw, rule, record, &mut metadata)?;
@@ -265,17 +250,17 @@ fn sign_sparse(name: &str, source: Blob, stock: &Stock, record: &ImageRecord,
         (payload, metadata.nested_firmware) = resign_filesystem(payload, filesystem, keys, name)?;
     }
     let (raw, descriptor) = add_avb(payload, stock, record, rule, keys, policy, &mut metadata)?;
-    let image = codesigner::sign_sparse(sparse::encode(raw, 4096)?, &seed, name, keys)?;
+    let image = if stage { codesigner::stage_sparse(raw, &seed, name, keys)? } else { codesigner::sign_sparse(sparse::encode(raw, 4096)?, &seed, name, keys)? };
     Ok(SignedImage { image, descriptor, partition: rule.partition.clone(), metadata })
 }
 
 fn build(name: &str, source: Blob, stock: &Stock, rule: &ImageRule,
-         keys: &Keys, policy: &AvbGenerationPolicy, nested: bool) -> Result<SignedImage> {
+         keys: &Keys, policy: &AvbGenerationPolicy, nested: bool, stage: bool) -> Result<SignedImage> {
     let record = stock.record(name)?;
     if record.partition() != rule.partition { bail!("{name}: stock/config partition mismatch") }
     match rule.codesigner {
         CodeSignerKind::Normal => sign_normal(name, source, stock, record, rule, keys, policy, nested),
-        CodeSignerKind::Sparse => sign_sparse(name, source, stock, record, rule, keys, policy, nested),
+        CodeSignerKind::Sparse => sign_sparse(name, source, stock, record, rule, keys, policy, nested, stage),
         CodeSignerKind::None => sign_without_codesigner(name, source, stock, record, rule, keys, policy, nested),
         CodeSignerKind::StandaloneVbmeta => bail!("use build-vbmeta for standalone vbmeta images"),
     }
@@ -284,12 +269,12 @@ fn build(name: &str, source: Blob, stock: &Stock, rule: &ImageRule,
 pub(super) fn sign(name: &str, source: Blob, stock: &Stock, rule: &ImageRule,
                    keys: &Keys, policy: &AvbGenerationPolicy) -> Result<SignedImage> {
     if rule.signs_firmware() { stock.require_firmware_key(keys)?; }
-    build(name, source, stock, rule, keys, policy, true)
+    build(name, source, stock, rule, keys, policy, true, false)
 }
 
 pub(super) fn wrap(name: &str, source: Blob, stock: &Stock, rule: &ImageRule,
-                   keys: &Keys, policy: &AvbGenerationPolicy) -> Result<SignedImage> {
-    build(name, source, stock, rule, keys, policy, false)
+                   keys: &Keys, policy: &AvbGenerationPolicy, stage: bool) -> Result<SignedImage> {
+    build(name, source, stock, rule, keys, policy, false, stage)
 }
 
 pub(super) fn record_from_stock(name: &str, source: Blob, rule: &ImageRule, capacity: Option<u64>) -> Result<ImageRecord> {

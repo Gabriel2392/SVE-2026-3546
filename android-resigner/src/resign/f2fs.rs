@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use lz4::block::{self, CompressionMode};
 
 use super::{blob::{self, Blob}, codesigner, crypto::Keys};
+use crate::par;
 
 const BLOCK: u64 = 4096;
 const SUPER_OFFSET: u64 = 1024;
@@ -46,7 +47,7 @@ enum FileData { Flat(u64), Clustered(Clustered) }
 struct File { nid: u32, node: u64, data: FileData, size: u64, name: String }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Candidate { file: File, ranges: Vec<codesigner::FirmwareRange> }
+struct Candidate { file: File, ranges: Vec<codesigner::FirmwareRange>, data: Vec<u8> }
 
 #[derive(Clone, Copy)]
 struct Geometry { main: u64, end: u64 }
@@ -268,20 +269,15 @@ fn inode(block: &[u8], node: u64, geometry: Geometry) -> Result<Option<File>> {
 fn files(source: &Blob) -> Result<(Geometry, Vec<File>)> {
     let layout = layout(source)?.context("not an F2FS image")?;
     let geometry = layout.geometry;
+    let chunk = 1u64 << 20;
     let mut scanned = Vec::new();
-    let mut buffer = vec![0; 4 << 20];
-    let mut at = geometry.main;
-    while at < geometry.end {
-        crate::cancel::check()?;
-        let count = buffer.len().min((geometry.end - at) as usize);
-        source.read_exact_at(at, &mut buffer[..count])?;
-        for (index, block) in buffer[..count].chunks_exact(BLOCK as usize).enumerate() {
-            let node = at + index as u64 * BLOCK;
-            let Some(file) = inode(block, node, geometry)? else { continue };
-            scanned.push(file);
-        }
-        at += count as u64;
-    }
+    par::ordered((geometry.end - geometry.main).div_ceil(chunk) as usize, |index| -> Result<Vec<File>> {
+        let at = geometry.main + index as u64 * chunk;
+        let mut buffer = vec![0; chunk.min(geometry.end - at) as usize];
+        source.read_exact_at(at, &mut buffer)?;
+        buffer.chunks_exact(BLOCK as usize).enumerate()
+            .filter_map(|(index, block)| inode(block, at + index as u64 * BLOCK, geometry).transpose()).collect()
+    }, |files| { scanned.extend(files); Ok(()) })?;
     let mut cache = BTreeMap::new(); let mut current = BTreeMap::<u32, File>::new();
     for file in scanned {
         let (ino, block) = layout.nat_entry(source, file.nid, &mut cache)?;
@@ -415,21 +411,22 @@ fn rewrite_file(source: &Blob, geometry: Geometry, file: &File, old: &[u8], new:
     Ok(changes)
 }
 
-fn candidates(source: &Blob) -> Result<Vec<Candidate>> {
+fn candidates(source: &Blob) -> Result<(Geometry, Vec<Candidate>)> {
     let (geometry, files) = files(source)?;
     let mut found = Vec::new();
-    for file in files {
+    par::ordered(files.len(), |index| -> Result<Option<Candidate>> {
         crate::cancel::check()?;
-        let head = file_range(source, geometry, &file, 0, 4)?;
-        let tail = file_range(source, geometry, &file, file.size as usize - 0x210, 0x210)?;
-        if head == b"\x7fELF" || codesigner::firmware_key_type(&tail).is_some() {
-            let data = read_file(source, geometry, &file)?;
-            let ranges = codesigner::firmware_ranges(&data)?;
-            if !ranges.is_empty() { found.push(Candidate { file, ranges }); }
-        }
-    }
+        let file = &files[index];
+        let head = file_range(source, geometry, file, 0, 4)?;
+        let tail = file_range(source, geometry, file, file.size as usize - 0x210, 0x210)?;
+        if head != b"\x7fELF" && codesigner::firmware_key_type(&tail).is_none() { return Ok(None) }
+        let data = read_file(source, geometry, file)?;
+        let ranges = codesigner::firmware_ranges(&data)?;
+        let data = if ranges.iter().any(|range| range.key_type <= 1) { data } else { Vec::new() };
+        Ok((!ranges.is_empty()).then(|| Candidate { file: file.clone(), ranges, data }))
+    }, |item| { found.extend(item); Ok(()) })?;
     found.sort_by_key(|item| (item.file.node, item.file.nid));
-    Ok(found)
+    Ok((geometry, found))
 }
 
 fn check_blocks(files: &[Candidate]) -> Result<()> {
@@ -468,44 +465,31 @@ fn check_blocks(files: &[Candidate]) -> Result<()> {
 }
 
 pub fn resign(source: Blob, keys: &Keys, description: &str) -> Result<(Blob, usize)> {
-    let geometry = layout(&source)?.context("not an F2FS image")?.geometry;
-    let before = candidates(&source)?;
+    let (geometry, before) = candidates(&source)?;
     check_blocks(&before)?;
-    let mut changes = Vec::new();
+    let mut changes = Vec::new(); let mut changed = Vec::new();
     let mut count = 0;
-    for item in &before {
-        let file = &item.file;
-        let mut data = read_file(&source, geometry, file)?;
-        let original = data.clone();
-        let ranges = codesigner::sign_firmware(&mut data, keys, &format!("{description}:inode-{:#x}", file.nid))?;
-        if ranges != item.ranges { bail!("{description}: CodeSigner ranges changed for inode {:#x}", file.nid) }
-        if original.iter().zip(&data).enumerate().any(|(at, (old, new))| old != new && !ranges.iter().any(|range| {
+    for item in before {
+        let file = item.file;
+        let mut data = item.data.clone();
+        if !codesigner::sign_firmware(&mut data, &item.ranges, keys, &format!("{description}:inode-{:#x}", file.nid))? { continue }
+        if item.data.iter().zip(&data).enumerate().any(|(at, (old, new))| old != new && !item.ranges.iter().any(|range| {
             range.key_type <= 1 && ((range.end - 0x208..range.end - 0x200).contains(&at)
                 || (range.end - 0x200..range.end - 0x200 + 136).contains(&at))
         })) {
             bail!("{description}: CodeSigner update escaped the existing footer for inode {:#x}", file.nid)
         }
-        if codesigner::verify_firmware(&data, keys, &format!("{description}:inode-{:#x}", file.nid))?
-            != codesigner::runtime_layout(&ranges, keys) {
-            bail!("{description}: CodeSigner verification changed ranges for inode {:#x}", file.nid)
-        }
-        for range in ranges.iter().filter(|range| range.key_type <= 1) {
-            eprintln!("CodeSigned {description}:{} ({})", file.name, if range.key_type == 0 { "TEE" } else { "REE" });
+        for range in item.ranges.iter().filter(|range| range.key_type <= 1) {
+            log!("CodeSigned {description}:{} ({})", file.name, if range.key_type == 0 { "TEE" } else { "REE" });
             count += 1;
         }
-        changes.extend(rewrite_file(&source, geometry, file, &original, &data)?);
+        changes.extend(rewrite_file(&source, geometry, &file, &item.data, &data)?);
+        changed.push((file, data));
     }
+    if changed.is_empty() { return Ok((source, count)) }
     let output = blob::patch(source, changes)?;
-    let after = candidates(&output)?;
-    if before.len() != after.len() || before.iter().zip(&after).any(|(old, new)| {
-        old.file != new.file || codesigner::runtime_layout(&old.ranges, keys) != new.ranges
-    }) { bail!("{description}: signed F2FS firmware set changed during rebuild") }
-    for item in &after {
-        let file = &item.file;
-        let data = read_file(&output, geometry, file)?;
-        if codesigner::verify_firmware(&data, keys, &format!("{description}:inode-{:#x}", file.nid))? != item.ranges {
-            bail!("{description}: CodeSigner verification changed ranges for inode {:#x}", file.nid)
-        }
+    for (file, data) in &changed {
+        if read_file(&output, geometry, file)? != *data { bail!("{description}: rewritten F2FS firmware does not match for inode {:#x}", file.nid) }
     }
     Ok((output, count))
 }
