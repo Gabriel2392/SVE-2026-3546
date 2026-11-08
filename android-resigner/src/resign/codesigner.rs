@@ -230,6 +230,22 @@ pub fn firmware_key_type(data: &[u8]) -> Option<u32> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirmwareRange { pub start: usize, pub end: usize, pub key_type: u32, pub key_index: u32 }
 
+pub(super) fn firmware_signature(range: FirmwareRange) -> std::ops::Range<usize> {
+    range.end - EXCLUDED..range.end - EXCLUDED + SIGNATURE
+}
+
+pub(super) fn vary_firmware(data: &mut [u8], ranges: &[FirmwareRange], keys: &Keys, attempt: u32) -> Result<()> {
+    for &range in ranges {
+        if range.key_type != 2 || range.key_index != key_index(&keys.ree) { bail!("firmware signature does not use the configured key") }
+        let signature = firmware_signature(range);
+        let digest = Sha512::digest(&data[range.start..signature.start]);
+        let value = crypto::padded_signature_variant(&keys.ree, &digest, attempt)?;
+        data[signature.clone()].copy_from_slice(&value);
+        if !crypto::verify_padded(keys.ree.verifying_key(), &digest, &value) { bail!("invalid CodeSigner signature") }
+    }
+    Ok(())
+}
+
 fn checked_end(start: usize, count: usize, size: usize, limit: usize) -> Result<usize> {
     start.checked_add(count.checked_mul(size).context("ELF table size overflow")?)
         .filter(|&end| end <= limit).context("ELF table exceeds file")

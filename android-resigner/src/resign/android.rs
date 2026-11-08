@@ -184,7 +184,7 @@ fn logical(config: &Config, stock: Blob, name: &str, keys: &Keys) -> Result<(Blo
             }
             changed.push((path, data));
         }
-        payload = erofs::replace_all(payload, &changed).with_context(|| format!("COW signing {name}"))?;
+        payload = erofs::replace_signed(payload, &mut changed, keys).with_context(|| format!("COW signing {name}"))?;
         for (path, data) in &changed {
             if erofs::read(payload.clone(), path)? != *data { bail!("{name}:{path}: rewritten firmware does not match") }
         }

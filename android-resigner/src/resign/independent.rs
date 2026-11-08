@@ -178,7 +178,7 @@ fn resign_filesystem(mut payload: Blob, rule: &Filesystem, keys: &Keys, descript
         }
         changed.push((path, data));
     }
-    payload = erofs::replace_all(payload, &changed)?;
+    payload = erofs::replace_signed(payload, &mut changed, keys)?;
     for (path, data) in &changed {
         if erofs::read(payload.clone(), path)? != *data { bail!("{description}:/{path}: rewritten firmware does not match") }
     }

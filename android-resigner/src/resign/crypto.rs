@@ -2,8 +2,9 @@ use std::{fs, path::Path};
 
 use anyhow::{bail, Context, Result};
 use ecdsa::RecoveryId;
-use p384::{EncodedPoint, ecdsa::{Signature, SigningKey, VerifyingKey, signature::hazmat::{PrehashSigner, PrehashVerifier}}, pkcs8::DecodePrivateKey};
+use p384::{EncodedPoint, ecdsa::{Signature, SigningKey, VerifyingKey, signature::hazmat::{PrehashSigner, PrehashVerifier, RandomizedPrehashSigner}}, elliptic_curve::rand_core::{CryptoRng, Error as RngError, RngCore}, pkcs8::DecodePrivateKey};
 use rsa::{BigUint, RsaPrivateKey, traits::PublicKeyParts};
+use sha2_10::{Digest, Sha512};
 
 pub struct Keys {
     pub tee: SigningKey,
@@ -59,6 +60,43 @@ pub fn padded_signature(key: &SigningKey, digest: &[u8]) -> Result<[u8; 136]> {
     let mut encoded = [0u8; 136];
     encoded[20..68].copy_from_slice(&signature.r().to_bytes());
     encoded[88..136].copy_from_slice(&signature.s().to_bytes());
+    Ok(encoded)
+}
+
+struct HashRng { seed: [u8; 64], block: [u8; 64], at: usize, count: u64 }
+
+impl HashRng {
+    fn new(digest: &[u8], attempt: u32) -> Self {
+        let mut hash = Sha512::new(); hash.update(b"CodeSigner/LZ4"); hash.update(digest); hash.update(attempt.to_le_bytes());
+        Self { seed: hash.finalize().into(), block: [0; 64], at: 64, count: 0 }
+    }
+
+    fn refill(&mut self) {
+        let mut hash = Sha512::new(); hash.update(self.seed); hash.update(self.count.to_le_bytes());
+        self.block = hash.finalize().into(); self.count += 1; self.at = 0;
+    }
+}
+
+impl RngCore for HashRng {
+    fn next_u32(&mut self) -> u32 { let mut out = [0; 4]; self.fill_bytes(&mut out); u32::from_le_bytes(out) }
+    fn next_u64(&mut self) -> u64 { let mut out = [0; 8]; self.fill_bytes(&mut out); u64::from_le_bytes(out) }
+    fn fill_bytes(&mut self, mut out: &mut [u8]) {
+        while !out.is_empty() {
+            if self.at == self.block.len() { self.refill(); }
+            let len = out.len().min(self.block.len() - self.at);
+            out[..len].copy_from_slice(&self.block[self.at..self.at + len]); self.at += len; out = &mut out[len..];
+        }
+    }
+    fn try_fill_bytes(&mut self, out: &mut [u8]) -> std::result::Result<(), RngError> { self.fill_bytes(out); Ok(()) }
+}
+
+impl CryptoRng for HashRng {}
+
+pub fn padded_signature_variant(key: &SigningKey, digest: &[u8], attempt: u32) -> Result<[u8; 136]> {
+    if digest.len() != 64 { bail!("invalid CodeSigner digest") }
+    let signature: Signature = key.sign_prehash_with_rng(&mut HashRng::new(digest, attempt), digest).context("P384 signing failed")?;
+    let mut encoded = [0; 136];
+    encoded[20..68].copy_from_slice(&signature.r().to_bytes()); encoded[88..136].copy_from_slice(&signature.s().to_bytes());
     Ok(encoded)
 }
 

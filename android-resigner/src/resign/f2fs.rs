@@ -8,10 +8,17 @@ use crate::par;
 
 const BLOCK: u64 = 4096;
 const SUPER_OFFSET: u64 = 1024;
+const SUPER_BYTES: usize = 1668;
+const CP_PAYLOAD: usize = 1664;
 const MAGIC: u32 = 0xf2f5_2010;
 const NODE_FOOTER: usize = 4072;
 const MAX_FIRMWARE: u64 = 512 << 20;
 const CHECKPOINT_BYTES: usize = 192;
+const CP_UMOUNT: u32 = 1;
+const CP_COMPACT: u32 = 4;
+const CP_ERROR: u32 = 8;
+const CP_FASTBOOT: u32 = 0x20;
+const CP_LARGE_NAT: u32 = 0x400;
 const NAT_ENTRY_BYTES: usize = 9;
 const NAT_ENTRIES_PER_BLOCK: u32 = 455;
 const SUMMARY_JOURNAL: usize = 512 * 7;
@@ -19,8 +26,12 @@ const INODE_ADDR: usize = 360;
 const INODE_NIDS: usize = NODE_FOOTER - 20;
 const NODE_ADDRS: usize = NODE_FOOTER / 4;
 const INLINE_XATTR: u8 = 1;
+const INLINE_DATA: u8 = 2;
 const EXTRA_ATTR: u8 = 0x20;
+const COMPRESS_RELEASED: u8 = 0x80;
 const COMPRESS_FLAG: u32 = 4;
+const ENCRYPT_FLAG: u32 = 0x800;
+const VERITY_FLAG: u32 = 0x0010_0000;
 const COMPRESS_ADDR: u32 = u32::MAX - 1;
 const NEW_ADDR: u32 = u32::MAX;
 const COMPRESS_HEADER: usize = 24;
@@ -28,7 +39,6 @@ const COMPRESS_HEADER: usize = 24;
 fn le16(data: &[u8], at: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(data.get(at..at + 2).context("truncated F2FS u16")?.try_into().unwrap()))
 }
-
 fn le32(data: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(data.get(at..at + 4).context("truncated F2FS u32")?.try_into().unwrap()))
 }
@@ -41,7 +51,10 @@ fn le64(data: &[u8], at: usize) -> Result<u64> {
 struct Clustered { algorithm: u8, log: u8, flags: u16, blocks: Vec<u32>, nids: [u32; 5] }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum FileData { Flat(u64), Clustered(Clustered) }
+struct Mapped { blocks: Vec<u32>, nids: [u32; 5] }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FileData { Flat(u64), Mapped(Mapped), Clustered(Clustered) }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct File { nid: u32, node: u64, data: FileData, size: u64, name: String }
@@ -103,8 +116,8 @@ fn active_checkpoint(source: &Blob, cp_block: u32, blocks_per_segment: u32) -> R
 }
 
 fn layout(source: &Blob) -> Result<Option<Layout>> {
-    if source.len()? < SUPER_OFFSET + 128 { return Ok(None) }
-    let mut superblock = [0; 128]; source.read_exact_at(SUPER_OFFSET, &mut superblock)?;
+    if source.len()? < SUPER_OFFSET + SUPER_BYTES as u64 { return Ok(None) }
+    let mut superblock = [0; SUPER_BYTES]; source.read_exact_at(SUPER_OFFSET, &mut superblock)?;
     if le32(&superblock, 0)? != MAGIC { return Ok(None) }
     if le32(&superblock, 16)? != 12 { bail!("unsupported F2FS block size") }
     let blocks_per_segment = 1u32.checked_shl(le32(&superblock, 20)?).context("invalid F2FS segment geometry")?;
@@ -115,25 +128,42 @@ fn layout(source: &Blob) -> Result<Option<Layout>> {
     let end = main.checked_add(bytes).filter(|&end| end <= source_len).context("F2FS main area exceeds image")?;
     let checkpoint = active_checkpoint(source, le32(&superblock, 76)?, blocks_per_segment)?;
     let flags = le32(&checkpoint.block, 132)?;
-    if flags & 1 == 0 || flags & (0x4 | 0x400) != 0 { bail!("unsupported F2FS checkpoint layout flags {flags:#x}") }
+    if flags & CP_ERROR != 0 { bail!("F2FS checkpoint has an error flag") }
     let sit_bytes = le32(&checkpoint.block, 156)? as usize;
     let nat_bytes = le32(&checkpoint.block, 160)? as usize;
     let nat_blocks = (le32(&superblock, 60)? / 2).checked_mul(blocks_per_segment).context("F2FS NAT geometry overflow")?;
     if nat_bytes != nat_blocks.div_ceil(8) as usize { bail!("inconsistent F2FS NAT bitmap size") }
-    let bitmap_at = CHECKPOINT_BYTES.checked_add(sit_bytes).context("F2FS bitmap offset overflow")?;
-    let bitmap_end = bitmap_at.checked_add(nat_bytes).filter(|&end| end <= 4092).context("F2FS NAT bitmap exceeds checkpoint")?;
-    let nat_bitmap = checkpoint.block[bitmap_at..bitmap_end].to_vec();
+    let payload = le32(&superblock, CP_PAYLOAD)? as usize;
+    let cp_len = payload.checked_add(1).and_then(|blocks| blocks.checked_mul(BLOCK as usize)).context("F2FS checkpoint size overflow")?;
+    let mut cp = vec![0; cp_len];
+    source.read_exact_at(checkpoint.start as u64 * BLOCK, &mut cp)?;
+    let bitmap_at = if flags & CP_LARGE_NAT != 0 {
+        CHECKPOINT_BYTES + 4
+    } else if payload != 0 {
+        CHECKPOINT_BYTES
+    } else {
+        CHECKPOINT_BYTES.checked_add(sit_bytes).context("F2FS bitmap offset overflow")?
+    };
+    let bitmap_end = bitmap_at.checked_add(nat_bytes).filter(|&end| end <= cp.len()).context("F2FS NAT bitmap exceeds checkpoint")?;
+    let nat_bitmap = cp[bitmap_at..bitmap_end].to_vec();
 
     let total = le32(&checkpoint.block, 136)?;
-    if total < 7 { bail!("F2FS checkpoint pack has no normal summary blocks") }
-    let summary_block = checkpoint.start.checked_add(total - 7).context("F2FS summary offset overflow")?;
+    let start_sum = le32(&checkpoint.block, 140)?;
+    let (summary_block, journal_at) = if flags & CP_COMPACT != 0 {
+        if start_sum >= total { bail!("F2FS compact summary is outside the checkpoint pack") }
+        (checkpoint.start.checked_add(start_sum).context("F2FS summary offset overflow")?, 0)
+    } else {
+        let tail = if flags & (CP_UMOUNT | CP_FASTBOOT) != 0 { 7 } else { 4 };
+        if total < tail { bail!("F2FS checkpoint pack has no data summary blocks") }
+        (checkpoint.start.checked_add(total - tail).context("F2FS summary offset overflow")?, SUMMARY_JOURNAL)
+    };
     let mut summary = vec![0; BLOCK as usize]; source.read_exact_at(summary_block as u64 * BLOCK, &mut summary)?;
-    let count = le16(&summary, SUMMARY_JOURNAL)? as usize;
+    let count = le16(&summary, journal_at)? as usize;
     let maximum = (4096 - 5 - SUMMARY_JOURNAL - 2) / 13;
     if count > maximum { bail!("invalid F2FS NAT journal entry count") }
     let mut nat_journal = BTreeMap::new();
     for index in 0..count {
-        let at = SUMMARY_JOURNAL + 2 + index * 13;
+        let at = journal_at + 2 + index * 13;
         let nid = le32(&summary, at)?;
         let ino = le32(&summary, at + 5)?;
         let block = le32(&summary, at + 9)?;
@@ -210,16 +240,20 @@ impl Layout {
 
     fn resolve(&self, source: &Blob, file: &mut File, nat: &mut BTreeMap<u64, Vec<u8>>,
                nodes: &mut BTreeMap<u32, Vec<u8>>) -> Result<()> {
-        let FileData::Clustered(data) = &mut file.data else { return Ok(()) };
-        let cluster = 1usize.checked_shl(data.log.into()).context("invalid F2FS cluster size")?;
+        let (blocks, nids, cluster) = match &mut file.data {
+            FileData::Flat(_) => return Ok(()),
+            FileData::Mapped(data) => (&mut data.blocks, data.nids, 1),
+            FileData::Clustered(data) => (&mut data.blocks, data.nids,
+                1usize.checked_shl(data.log.into()).context("invalid F2FS cluster size")?),
+        };
         let pages = usize::try_from(file.size.div_ceil(BLOCK)).context("F2FS file page count overflow")?;
         let wanted = pages.checked_add(cluster - 1).map(|value| value & !(cluster - 1)).context("F2FS cluster count overflow")?;
-        data.blocks.truncate(data.blocks.len() & !(cluster - 1));
-        data.blocks.truncate(wanted);
+        blocks.truncate(blocks.len() & !(cluster - 1));
+        blocks.truncate(wanted);
         for (index, depth) in [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2)] {
-            self.append_node(source, data.nids[index], file.nid, depth, cluster, wanted, &mut data.blocks, nat, nodes)?;
+            self.append_node(source, nids[index], file.nid, depth, cluster, wanted, blocks, nat, nodes)?;
         }
-        if data.blocks.len() != wanted { bail!("F2FS inode {:#x} has {} of {wanted} data addresses", file.nid, data.blocks.len()) }
+        if blocks.len() != wanted { bail!("F2FS inode {:#x} has {} of {wanted} data addresses", file.nid, blocks.len()) }
         Ok(())
     }
 }
@@ -234,34 +268,41 @@ fn inode(block: &[u8], node: u64, geometry: Geometry) -> Result<Option<File>> {
     let len = le32(block, 88)? as usize;
     let name = block.get(92..92 + len.min(255)).and_then(|value| std::str::from_utf8(value).ok())
         .filter(|value| !value.is_empty()).map(str::to_owned).unwrap_or_else(|| format!("inode-{nid:x}"));
-    if inline & 0x02 != 0 { return Ok(None) }
-    let data = if le32(block, 80)? & COMPRESS_FLAG != 0 {
+    if inline & INLINE_DATA != 0 { return Ok(None) }
+    let flags = le32(block, 80)?;
+    if flags & (ENCRYPT_FLAG | VERITY_FLAG) != 0 || block[2] & (0x04 | 0x40) != 0 { return Ok(None) }
+    let extra = if inline & EXTRA_ATTR == 0 { 0 } else { le16(block, INODE_ADDR)? as usize };
+    if extra & 3 != 0 || INODE_ADDR.checked_add(extra).is_none_or(|start| start > INODE_NIDS) {
+        bail!("invalid F2FS extra attribute size {extra}")
+    }
+    let xattrs = if inline & INLINE_XATTR == 0 { 0 } else if inline & EXTRA_ATTR == 0 { 50 } else {
+        let value = le16(block, INODE_ADDR + 2)? as usize; if value == 0 { 50 } else { value }
+    };
+    let start = INODE_ADDR + extra;
+    let end = INODE_NIDS.checked_sub(xattrs.checked_mul(4).context("F2FS inline xattr overflow")?)
+        .filter(|&end| start <= end).context("F2FS inode addresses overlap xattrs")?;
+    let mut blocks = Vec::with_capacity((end - start) / 4);
+    for at in (start..end).step_by(4) { blocks.push(le32(block, at)?); }
+    let mut nids = [0; 5];
+    for (index, at) in (INODE_NIDS..NODE_FOOTER).step_by(4).enumerate() { nids[index] = le32(block, at)?; }
+    let data = if flags & COMPRESS_FLAG != 0 {
         if inline & EXTRA_ATTR == 0 { bail!("compressed F2FS inode {nid:#x} has no extra attributes") }
-        let extra = le16(block, INODE_ADDR)? as usize;
         if extra < 36 || extra & 3 != 0 { bail!("invalid compressed F2FS extra size {extra}") }
-        let xattrs = if inline & INLINE_XATTR == 0 { 0 } else {
-            let value = le16(block, INODE_ADDR + 2)? as usize; if value == 0 { 50 } else { value }
-        };
-        let start = INODE_ADDR.checked_add(extra).context("F2FS inode address overflow")?;
-        let end = INODE_NIDS.checked_sub(xattrs.checked_mul(4).context("F2FS inline xattr overflow")?)
-            .filter(|&end| start <= end).context("F2FS inode addresses overlap xattrs")?;
-        let mut blocks = Vec::with_capacity((end - start) / 4);
-        for at in (start..end).step_by(4) { blocks.push(le32(block, at)?); }
-        let mut nids = [0; 5];
-        for (index, at) in (INODE_NIDS..NODE_FOOTER).step_by(4).enumerate() { nids[index] = le32(block, at)?; }
         let algorithm = block[INODE_ADDR + 32];
         let log = block[INODE_ADDR + 33];
         if !(2..=8).contains(&log) { bail!("invalid F2FS cluster log {log}") }
         FileData::Clustered(Clustered { algorithm, log, flags: le16(block, INODE_ADDR + 34)?, blocks, nids })
     } else {
-        if inline & 0x80 != 0 || le32(block, 80)? != 0 { return Ok(None) }
+        if inline & COMPRESS_RELEASED != 0 { return Ok(None) }
         let file_offset = le32(block, 348)?;
         let first = le32(block, 352)? as u64;
-        let blocks = le32(block, 356)? as u64;
-        if file_offset != 0 || first <= 1 || blocks == 0 || size > blocks.checked_mul(BLOCK).context("F2FS extent size overflow")? { return Ok(None) }
+        let extent_blocks = le32(block, 356)? as u64;
+        let flat = file_offset == 0 && first > 1 && extent_blocks != 0
+            && size <= extent_blocks.checked_mul(BLOCK).context("F2FS extent size overflow")?;
         let at = first.checked_mul(BLOCK).context("F2FS extent offset overflow")?;
-        if at < geometry.main || at.checked_add(size).filter(|&end| end <= geometry.end).is_none() { return Ok(None) }
-        FileData::Flat(at)
+        if flat && at >= geometry.main && at.checked_add(size).is_some_and(|end| end <= geometry.end) {
+            FileData::Flat(at)
+        } else { FileData::Mapped(Mapped { blocks, nids }) }
     };
     Ok(Some(File { nid, node, data, size, name }))
 }
@@ -300,6 +341,12 @@ fn read_block(source: &Blob, geometry: Geometry, block: u32) -> Result<Vec<u8>> 
     let mut data = vec![0; BLOCK as usize]; source.read_exact_at(at, &mut data)?; Ok(data)
 }
 
+fn mapped_block(source: &Blob, geometry: Geometry, block: u32) -> Result<Vec<u8>> {
+    if matches!(block, 0 | NEW_ADDR) { return Ok(vec![0; BLOCK as usize]) }
+    if block == COMPRESS_ADDR { bail!("compression marker in an uncompressed F2FS file") }
+    read_block(source, geometry, block)
+}
+
 fn cluster(source: &Blob, geometry: Geometry, data: &Clustered, index: usize) -> Result<Vec<u8>> {
     let count = 1usize << data.log;
     let start = index.checked_mul(count).context("F2FS cluster offset overflow")?;
@@ -336,6 +383,11 @@ fn read_file(source: &Blob, geometry: Geometry, file: &File) -> Result<Vec<u8>> 
         FileData::Flat(at) => {
             let mut out = vec![0; file.size as usize]; source.read_exact_at(*at, &mut out)?; Ok(out)
         }
+        FileData::Mapped(data) => {
+            let mut out = Vec::with_capacity(data.blocks.len() * BLOCK as usize);
+            for &block in &data.blocks { out.extend_from_slice(&mapped_block(source, geometry, block)?); }
+            out.truncate(file.size as usize); Ok(out)
+        }
         FileData::Clustered(data) => {
             let bytes = (BLOCK as usize) << data.log;
             let count = (file.size as usize).div_ceil(bytes);
@@ -351,6 +403,14 @@ fn file_range(source: &Blob, geometry: Geometry, file: &File, start: usize, len:
     match &file.data {
         FileData::Flat(at) => {
             let mut out = vec![0; len]; source.read_exact_at(*at + start as u64, &mut out)?; Ok(out)
+        }
+        FileData::Mapped(data) => {
+            let first = start / BLOCK as usize; let last = (end - 1) / BLOCK as usize;
+            let mut out = Vec::with_capacity((last - first + 1) * BLOCK as usize);
+            for &block in data.blocks.get(first..=last).context("F2FS range exceeds address map")? {
+                out.extend_from_slice(&mapped_block(source, geometry, block)?);
+            }
+            let at = start - first * BLOCK as usize; Ok(out[at..at + len].to_vec())
         }
         FileData::Clustered(data) => {
             let bytes = (BLOCK as usize) << data.log;
@@ -379,6 +439,24 @@ fn rewrite_file(source: &Blob, geometry: Geometry, file: &File, old: &[u8], new:
     if old.len() != new.len() || old.len() != file.size as usize { bail!("F2FS replacement size changed") }
     let data = match &file.data {
         FileData::Flat(at) => return Ok(if old == new { Vec::new() } else { vec![(*at, new.to_vec())] }),
+        FileData::Mapped(data) => {
+            let mut changes = Vec::new();
+            for (index, &block) in data.blocks.iter().enumerate() {
+                let at = index * BLOCK as usize;
+                if at >= old.len() { break }
+                let len = (old.len() - at).min(BLOCK as usize);
+                if old[at..at + len] == new[at..at + len] { continue }
+                if matches!(block, 0 | NEW_ADDR) {
+                    if new[at..at + len].iter().any(|&byte| byte != 0) { bail!("F2FS rewrite would allocate a sparse block") }
+                    continue
+                }
+                let mut page = read_block(source, geometry, block)?;
+                if page[..len] != old[at..at + len] { bail!("F2FS mapped file changed during rewrite") }
+                page[..len].copy_from_slice(&new[at..at + len]);
+                changes.push((block as u64 * BLOCK, page));
+            }
+            return Ok(changes)
+        }
         FileData::Clustered(data) => data,
     };
     let count = 1usize << data.log; let bytes = count * BLOCK as usize;
@@ -453,6 +531,13 @@ fn check_blocks(files: &[Candidate]) -> Result<()> {
                     }
                 }
             }
+            FileData::Mapped(data) => for (slot, &block) in data.blocks.iter().enumerate() {
+                if matches!(block, 0 | NEW_ADDR) { continue }
+                if block == COMPRESS_ADDR { bail!("compression marker in an uncompressed F2FS file") }
+                if let Some((nid, old)) = used.insert(block, (file.nid, slot)) {
+                    bail!("F2FS data block {block:#x} aliases inode {nid:#x}:{old:#x} and {:#x}:{slot:#x}", file.nid)
+                }
+            },
             FileData::Clustered(data) => for (slot, &block) in data.blocks.iter().enumerate() {
                 if matches!(block, 0 | NEW_ADDR | COMPRESS_ADDR) { continue }
                 if let Some((nid, old)) = used.insert(block, (file.nid, slot)) {
