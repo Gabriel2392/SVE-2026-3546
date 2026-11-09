@@ -138,6 +138,8 @@ pub struct Filesystem {
     pub sign_firmware: Vec<String>,
     #[serde(default)]
     pub remove: Vec<String>,
+    #[serde(default)]
+    pub remove_if_present: Vec<String>,
 }
 
 fn safe_name(name: &str) -> bool {
@@ -167,7 +169,7 @@ fn validate_filesystem(name: &str, rules: &Filesystem) -> Result<()> {
         if !safe_posix(path) { bail!("unsafe filesystem path {path:?} in {name}") }
         if !paths.insert(path) { bail!("duplicate filesystem path {path:?} in {name}") }
     }
-    for path in &rules.remove {
+    for path in rules.remove.iter().chain(&rules.remove_if_present) {
         if !safe_posix(path) { bail!("unsafe filesystem removal path {path:?} in {name}") }
         if !paths.insert(path) { bail!("duplicate filesystem path {path:?} in {name}") }
     }

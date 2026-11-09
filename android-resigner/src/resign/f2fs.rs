@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
 use lz4::block::{self, CompressionMode};
@@ -8,18 +8,26 @@ use crate::par;
 
 const BLOCK: u64 = 4096;
 const SUPER_OFFSET: u64 = 1024;
-const SUPER_BYTES: usize = 1668;
+const FEATURE: usize = 2180;
+const SUPER_BYTES: usize = FEATURE + 4;
 const CP_PAYLOAD: usize = 1664;
 const MAGIC: u32 = 0xf2f5_2010;
 const NODE_FOOTER: usize = 4072;
 const MAX_FIRMWARE: u64 = 512 << 20;
 const CHECKPOINT_BYTES: usize = 192;
+const PRJQUOTA: u32 = 0x10;
+const INODE_CHECKSUM: u32 = 0x20;
+const QUOTA_INO: u32 = 0x80;
 const CP_UMOUNT: u32 = 1;
 const CP_COMPACT: u32 = 4;
 const CP_ERROR: u32 = 8;
 const CP_FASTBOOT: u32 = 0x20;
+const CP_NAT_BITS: u32 = 0x80;
 const CP_LARGE_NAT: u32 = 0x400;
 const NAT_ENTRY_BYTES: usize = 9;
+const SIT_ENTRY: usize = 74;
+const SIT_PER_BLOCK: u32 = 55;
+const SIT_JOURNAL: usize = 507;
 const NAT_ENTRIES_PER_BLOCK: u32 = 455;
 const SUMMARY_JOURNAL: usize = 512 * 7;
 const INODE_ADDR: usize = 360;
@@ -27,6 +35,10 @@ const INODE_NIDS: usize = NODE_FOOTER - 20;
 const NODE_ADDRS: usize = NODE_FOOTER / 4;
 const INLINE_XATTR: u8 = 1;
 const INLINE_DATA: u8 = 2;
+const INLINE_DENTRY: u8 = 4;
+const DIR_ENTRY: usize = 11;
+const FT_FILE: u8 = 1;
+const FT_DIR: u8 = 2;
 const EXTRA_ATTR: u8 = 0x20;
 const COMPRESS_RELEASED: u8 = 0x80;
 const COMPRESS_FLAG: u32 = 4;
@@ -65,6 +77,13 @@ struct Candidate { file: File, ranges: Vec<codesigner::FirmwareRange>, data: Vec
 #[derive(Clone, Copy)]
 struct Geometry { main: u64, end: u64 }
 
+struct Slots { bitmap: usize, entries: usize, names: usize, count: usize }
+struct Freed { nodes: Vec<u32>, blocks: Vec<u32> }
+
+const BLOCK_SLOTS: Slots = Slots { bitmap: 0, entries: 30, names: 30 + 214 * DIR_ENTRY, count: 214 };
+
+type Patches = Vec<(u64, Vec<u8>)>;
+
 struct Layout {
     geometry: Geometry,
     nat_block: u64,
@@ -72,6 +91,19 @@ struct Layout {
     blocks_per_segment: u32,
     nat_bitmap: Vec<u8>,
     nat_journal: BTreeMap<u32, (u32, u32)>,
+    root: u32,
+    checksum: Option<u32>,
+    quota: bool,
+    sit_block: u64,
+    sit_blocks: u32,
+    sit_bitmap: Vec<u8>,
+    nat_journal_at: BTreeMap<u32, u64>,
+    sit_journal_at: BTreeMap<u32, u64>,
+    cp_first: u64,
+    cp_last: u64,
+    main_block: u64,
+    segments: u32,
+    current: [u32; 6],
 }
 
 fn crc32(mut crc: u32, data: &[u8]) -> u32 {
@@ -146,40 +178,62 @@ fn layout(source: &Blob) -> Result<Option<Layout>> {
     };
     let bitmap_end = bitmap_at.checked_add(nat_bytes).filter(|&end| end <= cp.len()).context("F2FS NAT bitmap exceeds checkpoint")?;
     let nat_bitmap = cp[bitmap_at..bitmap_end].to_vec();
+    let sit_at = if flags & CP_LARGE_NAT != 0 { CHECKPOINT_BYTES + 4 + nat_bytes } else if payload != 0 { BLOCK as usize } else { CHECKPOINT_BYTES };
+    let sit_bitmap = cp.get(sit_at..sit_at + sit_bytes).context("F2FS SIT bitmap exceeds checkpoint")?.to_vec();
 
     let total = le32(&checkpoint.block, 136)?;
     let start_sum = le32(&checkpoint.block, 140)?;
-    let (summary_block, journal_at) = if flags & CP_COMPACT != 0 {
+    let (summary_block, journal_at, sit_journal) = if flags & CP_COMPACT != 0 {
         if start_sum >= total { bail!("F2FS compact summary is outside the checkpoint pack") }
-        (checkpoint.start.checked_add(start_sum).context("F2FS summary offset overflow")?, 0)
+        let block = checkpoint.start.checked_add(start_sum).context("F2FS summary offset overflow")?;
+        (block, 0, (block, SIT_JOURNAL))
     } else {
-        let tail = if flags & (CP_UMOUNT | CP_FASTBOOT) != 0 { 7 } else { 4 };
-        if total < tail { bail!("F2FS checkpoint pack has no data summary blocks") }
-        (checkpoint.start.checked_add(total - tail).context("F2FS summary offset overflow")?, SUMMARY_JOURNAL)
+        let (hot, cold) = if flags & (CP_UMOUNT | CP_FASTBOOT) != 0 { (7, 5) } else { (4, 2) };
+        if total < hot { bail!("F2FS checkpoint pack has no data summary blocks") }
+        let end = checkpoint.start.checked_add(total).context("F2FS summary offset overflow")?;
+        (end - hot, SUMMARY_JOURNAL, (end - cold, SUMMARY_JOURNAL))
     };
     let mut summary = vec![0; BLOCK as usize]; source.read_exact_at(summary_block as u64 * BLOCK, &mut summary)?;
     let count = le16(&summary, journal_at)? as usize;
     let maximum = (4096 - 5 - SUMMARY_JOURNAL - 2) / 13;
     if count > maximum { bail!("invalid F2FS NAT journal entry count") }
-    let mut nat_journal = BTreeMap::new();
+    let mut nat_journal = BTreeMap::new(); let mut nat_journal_at = BTreeMap::new();
     for index in 0..count {
         let at = journal_at + 2 + index * 13;
         let nid = le32(&summary, at)?;
         let ino = le32(&summary, at + 5)?;
         let block = le32(&summary, at + 9)?;
         if nat_journal.insert(nid, (ino, block)).is_some() { bail!("duplicate F2FS NAT journal entry") }
+        nat_journal_at.insert(nid, summary_block as u64 * BLOCK + at as u64 + 4);
+    }
+    let mut sit_journal_at = BTreeMap::new();
+    let (block, base) = sit_journal;
+    let mut sums = vec![0; BLOCK as usize]; source.read_exact_at(block as u64 * BLOCK, &mut sums)?;
+    let count = le16(&sums, base)? as usize;
+    if count > 6 { bail!("invalid F2FS SIT journal entry count") }
+    for index in 0..count {
+        let at = base + 2 + index * (SIT_ENTRY + 4);
+        if sit_journal_at.insert(le32(&sums, at)?, block as u64 * BLOCK + at as u64 + 4).is_some() {
+            bail!("duplicate F2FS SIT journal entry")
+        }
     }
     Ok(Some(Layout {
         geometry: Geometry { main, end }, nat_block: le32(&superblock, 84)? as u64,
-        nat_blocks, blocks_per_segment, nat_bitmap, nat_journal,
+        nat_blocks, blocks_per_segment, nat_bitmap, nat_journal, root: le32(&superblock, 96)?,
+        checksum: (le32(&superblock, FEATURE)? & INODE_CHECKSUM != 0).then(|| crc32(!0, &superblock[108..124])),
+        quota: le32(&superblock, FEATURE)? & (PRJQUOTA | QUOTA_INO) != 0, sit_block: le32(&superblock, 80)? as u64, sit_blocks: (le32(&superblock, 56)? / 2).checked_mul(blocks_per_segment).context("F2FS SIT geometry overflow")?,
+        sit_bitmap, nat_journal_at, sit_journal_at, cp_first: checkpoint.start as u64, cp_last: (checkpoint.start + total - 1) as u64,
+        main_block: main / BLOCK, segments: le32(&superblock, 68)?,
+        current: [le32(&checkpoint.block, 36)?, le32(&checkpoint.block, 40)?, le32(&checkpoint.block, 44)?,
+            le32(&checkpoint.block, 84)?, le32(&checkpoint.block, 88)?, le32(&checkpoint.block, 92)?],
     }))
 }
 
 pub fn present(source: &Blob) -> Result<bool> { Ok(layout(source)?.is_some()) }
 
 impl Layout {
-    fn nat_entry(&self, source: &Blob, nid: u32, cache: &mut BTreeMap<u64, Vec<u8>>) -> Result<(u32, u32)> {
-        if let Some(&entry) = self.nat_journal.get(&nid) { return Ok(entry) }
+    fn nat_location(&self, nid: u32) -> Result<u64> {
+        if let Some(&at) = self.nat_journal_at.get(&nid) { return Ok(at) }
         let block_off = nid / NAT_ENTRIES_PER_BLOCK;
         if block_off >= self.nat_blocks { bail!("F2FS inode {nid:#x} exceeds NAT") }
         let segment = block_off / self.blocks_per_segment;
@@ -189,12 +243,27 @@ impl Layout {
             .and_then(|value| value.checked_add(within as u64)).context("F2FS NAT offset overflow")?;
         let bit = 1 << (7 - (block_off & 7));
         if self.nat_bitmap[block_off as usize / 8] & bit != 0 { block += self.blocks_per_segment as u64; }
+        Ok(block * BLOCK + (nid % NAT_ENTRIES_PER_BLOCK) as u64 * NAT_ENTRY_BYTES as u64)
+    }
+
+    fn nat_entry(&self, source: &Blob, nid: u32, cache: &mut BTreeMap<u64, Vec<u8>>) -> Result<(u32, u32)> {
+        if let Some(&entry) = self.nat_journal.get(&nid) { return Ok(entry) }
+        let location = self.nat_location(nid)?; let block = location / BLOCK;
         if !cache.contains_key(&block) {
             let mut data = vec![0; BLOCK as usize]; source.read_exact_at(block * BLOCK, &mut data)?; cache.insert(block, data);
         }
         let data = &cache[&block];
-        let at = (nid % NAT_ENTRIES_PER_BLOCK) as usize * NAT_ENTRY_BYTES;
+        let at = (location % BLOCK) as usize;
         Ok((le32(data, at + 1)?, le32(data, at + 5)?))
+    }
+
+    fn sit_location(&self, segno: u32) -> Result<u64> {
+        if let Some(&at) = self.sit_journal_at.get(&segno) { return Ok(at) }
+        let block_off = segno / SIT_PER_BLOCK;
+        if block_off >= self.sit_blocks { bail!("F2FS segment {segno:#x} exceeds SIT") }
+        let mut block = self.sit_block + block_off as u64;
+        if self.sit_bitmap.get(block_off as usize / 8).context("F2FS SIT bitmap is too short")? & (1 << (7 - (block_off & 7))) != 0 { block += self.sit_blocks as u64 }
+        Ok(block * BLOCK + (segno % SIT_PER_BLOCK) as u64 * SIT_ENTRY as u64)
     }
 
     fn node(&self, source: &Blob, nid: u32, ino: u32, nat: &mut BTreeMap<u64, Vec<u8>>,
@@ -256,6 +325,207 @@ impl Layout {
         if blocks.len() != wanted { bail!("F2FS inode {:#x} has {} of {wanted} data addresses", file.nid, blocks.len()) }
         Ok(())
     }
+
+    fn lookup(&self, source: &Blob, dir: u32, name: &[u8], nat: &mut BTreeMap<u64, Vec<u8>>,
+              nodes: &mut BTreeMap<u32, Vec<u8>>) -> Result<Option<(u32, u8, Patches)>> {
+        let node = self.node(source, dir, dir, nat, nodes)?;
+        if le16(&node, 0)? & 0o170000 != 0o040000 { bail!("F2FS inode {dir:#x} is not a directory") }
+        let (extra, xattrs) = inline_sizes(&node)?;
+        if node[3] & INLINE_DENTRY != 0 {
+            let slots = inline_slots(extra, xattrs)?;
+            let Some((slot, span, ino, kind)) = find_entry(&node, &slots, name)? else { return Ok(None) };
+            let base = self.nat_entry(source, dir, nat)?.1 as u64 * BLOCK;
+            let mut new = node.clone();
+            let mut patches = vec![clear_entry(&mut new, base, &slots, slot, span)];
+            if let Some(crc) = self.checksum_of(&new, extra)? { patches.push((base + (INODE_ADDR + 8) as u64, crc.to_le_bytes().to_vec())) }
+            return Ok(Some((ino, kind, patches)))
+        }
+        let mut file = File { nid: dir, node: 0, data: FileData::Mapped(mapped(&node, extra, xattrs)?), size: le64(&node, 16)?, name: String::new() };
+        self.resolve(source, &mut file, nat, nodes)?;
+        let FileData::Mapped(data) = file.data else { unreachable!() };
+        let mut found = None;
+        for block in data.blocks.into_iter().filter(|&block| !matches!(block, 0 | NEW_ADDR)) {
+            let mut area = read_block(source, self.geometry, block)?;
+            let Some((slot, span, ino, kind)) = find_entry(&area, &BLOCK_SLOTS, name)? else { continue };
+            let patch = clear_entry(&mut area, block as u64 * BLOCK, &BLOCK_SLOTS, slot, span);
+            if found.replace((ino, kind, vec![patch])).is_some() { bail!("duplicate F2FS directory entry {}", String::from_utf8_lossy(name)) }
+        }
+        Ok(found)
+    }
+
+    fn checksum_of(&self, block: &[u8], extra: usize) -> Result<Option<u32>> {
+        self.checksum.filter(|_| block[3] & EXTRA_ATTR != 0 && extra >= 12).map(|seed| inode_checksum(seed, block)).transpose()
+    }
+
+    fn collect(&self, source: &Blob, nid: u32, ino: u32, depth: u8, nat: &mut BTreeMap<u64, Vec<u8>>,
+               nodes: &mut BTreeMap<u32, Vec<u8>>, freed: &mut Freed) -> Result<()> {
+        if nid == 0 { return Ok(()) }
+        let data = self.node(source, nid, ino, nat, nodes)?;
+        freed.nodes.push(nid);
+        for at in (0..NODE_FOOTER).step_by(4) {
+            let value = le32(&data, at)?;
+            if depth > 0 { self.collect(source, value, ino, depth - 1, nat, nodes, freed)? }
+            else if !matches!(value, 0 | NEW_ADDR | COMPRESS_ADDR) { freed.blocks.push(value) }
+        }
+        Ok(())
+    }
+
+    fn invalidate(&self, edit: &mut Edit, block: u32) -> Result<()> {
+        let bps = self.blocks_per_segment as u64;
+        let relative = (block as u64).checked_sub(self.main_block).filter(|&value| value < self.segments as u64 * bps)
+            .with_context(|| format!("F2FS block {block:#x} is outside the main area"))?;
+        let (segno, offset) = ((relative / bps) as u32, (relative % bps) as usize);
+        let entry = edit.bytes(self.sit_location(segno)?, SIT_ENTRY)?;
+        let (mask, vblocks) = (0x80 >> (offset % 8), le16(entry, 0)?);
+        if entry[2 + offset / 8] & mask == 0 || vblocks & 0x3ff == 0 { bail!("F2FS block {block:#x} is not valid in SIT") }
+        entry[2 + offset / 8] &= !mask; entry[..2].copy_from_slice(&(vblocks - 1).to_le_bytes());
+        edit.touched.insert(segno);
+        Ok(())
+    }
+
+    fn unlink_inode(&self, source: &Blob, ino: u32, edit: &mut Edit) -> Result<Vec<u32>> {
+        let (mut nat, mut nodes) = (BTreeMap::new(), BTreeMap::new());
+        let node = self.node(source, ino, ino, &mut nat, &mut nodes)?;
+        if le16(&node, 0)? & 0o170000 != 0o100000 { bail!("F2FS inode {ino:#x} is not a regular file") }
+        let (extra, xattrs) = inline_sizes(&node)?;
+        let links = le32(&node, 12)?;
+        if links > 1 {
+            let mut new = node.clone(); new[12..16].copy_from_slice(&(links - 1).to_le_bytes());
+            if let Some(crc) = self.checksum_of(&new, extra)? { new[INODE_ADDR + 8..INODE_ADDR + 12].copy_from_slice(&crc.to_le_bytes()) }
+            edit.bytes(self.nat_entry(source, ino, &mut nat)?.1 as u64 * BLOCK, BLOCK as usize)?.copy_from_slice(&new);
+            return Ok(Vec::new())
+        }
+        if self.quota { bail!("cannot remove an F2FS inode with quota metadata") }
+        let Mapped { blocks, nids } = mapped(&node, extra, xattrs)?;
+        let mut freed = Freed { nodes: vec![ino], blocks: Vec::new() };
+        if node[3] & INLINE_DATA == 0 { freed.blocks.extend(blocks.into_iter().filter(|&block| !matches!(block, 0 | NEW_ADDR | COMPRESS_ADDR))) }
+        for (nid, depth) in nids.into_iter().zip([0, 0, 1, 1, 2]) { self.collect(source, nid, ino, depth, &mut nat, &mut nodes, &mut freed)? }
+        let xattr = le32(&node, 76)?;
+        if xattr != 0 { self.node(source, xattr, ino, &mut nat, &mut nodes)?; freed.nodes.push(xattr) }
+        if freed.nodes.iter().collect::<BTreeSet<_>>().len() != freed.nodes.len() { bail!("F2FS inode {ino:#x} references a node twice") }
+        for &nid in &freed.nodes { freed.blocks.push(self.nat_entry(source, nid, &mut nat)?.1) }
+        if freed.blocks.iter().collect::<BTreeSet<_>>().len() != freed.blocks.len() { bail!("F2FS inode {ino:#x} references a block twice") }
+        for &nid in &freed.nodes { edit.bytes(self.nat_location(nid)?, NAT_ENTRY_BYTES)?.fill(0) }
+        for &block in &freed.blocks { self.invalidate(edit, block)? }
+        let mut free = 0;
+        for segno in edit.touched.clone() {
+            if !self.current.contains(&segno) && le16(edit.bytes(self.sit_location(segno)?, SIT_ENTRY)?, 0)? & 0x3ff == 0 { free += 1 }
+        }
+        let mut cp = edit.block(self.cp_first)?.clone();
+        if *edit.block(self.cp_last)? != cp { bail!("F2FS checkpoint header and footer differ") }
+        let blocks = le64(&cp, 16)?.checked_sub(freed.blocks.len() as u64).context("F2FS valid block counter underflow")?;
+        cp[16..24].copy_from_slice(&blocks.to_le_bytes());
+        for (at, value) in [(144, -(freed.nodes.len() as i64)), (148, -1), (32, free)] {
+            let count = u32::try_from(le32(&cp, at)? as i64 + value).context("F2FS checkpoint counter underflow")?;
+            cp[at..at + 4].copy_from_slice(&count.to_le_bytes());
+        }
+        let flags = le32(&cp, 132)? & !CP_NAT_BITS;
+        cp[132..136].copy_from_slice(&flags.to_le_bytes());
+        seal_checkpoint(&mut cp)?;
+        edit.block(self.cp_first)?.copy_from_slice(&cp); edit.block(self.cp_last)?.copy_from_slice(&cp);
+        Ok(freed.nodes)
+    }
+}
+
+struct Edit { source: Blob, blocks: BTreeMap<u64, Vec<u8>>, touched: BTreeSet<u32> }
+
+impl Edit {
+    fn block(&mut self, number: u64) -> Result<&mut Vec<u8>> {
+        if !self.blocks.contains_key(&number) {
+            let mut data = vec![0; BLOCK as usize]; self.source.read_exact_at(number * BLOCK, &mut data)?; self.blocks.insert(number, data);
+        }
+        Ok(self.blocks.get_mut(&number).unwrap())
+    }
+
+    fn bytes(&mut self, at: u64, len: usize) -> Result<&mut [u8]> {
+        let start = (at % BLOCK) as usize;
+        if start + len > BLOCK as usize { bail!("F2FS metadata entry crosses a block boundary") }
+        Ok(&mut self.block(at / BLOCK)?[start..start + len])
+    }
+
+    fn patches(&self) -> Result<Patches> {
+        let mut out = Vec::new();
+        for (&number, data) in &self.blocks {
+            let mut old = vec![0; BLOCK as usize]; self.source.read_exact_at(number * BLOCK, &mut old)?;
+            let mut at = 0;
+            while at < old.len() {
+                if old[at] == data[at] { at += 1; continue }
+                let start = at;
+                while at < old.len() && old[at] != data[at] { at += 1 }
+                out.push((number * BLOCK + start as u64, data[start..at].to_vec()));
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn seal_checkpoint(block: &mut [u8]) -> Result<()> {
+    let at = le32(block, 164)? as usize;
+    if !(CHECKPOINT_BYTES..=4092).contains(&at) { bail!("invalid F2FS checkpoint checksum offset") }
+    let mut crc = crc32(MAGIC, &block[..at]);
+    if at < 4092 { crc = crc32(crc, &block[at + 4..BLOCK as usize]); }
+    block[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
+fn inline_slots(extra: usize, xattrs: usize) -> Result<Slots> {
+    let max = 4 * ((INODE_NIDS - INODE_ADDR) / 4).checked_sub(extra / 4 + xattrs + 1).context("invalid F2FS inline dentry size")?;
+    let count = max * 8 / ((DIR_ENTRY + 8) * 8 + 1);
+    let entries = INODE_ADDR + extra + 4 + max - (DIR_ENTRY + 8) * count;
+    Ok(Slots { bitmap: INODE_ADDR + extra + 4, entries, names: entries + DIR_ENTRY * count, count })
+}
+
+fn find_entry(area: &[u8], slots: &Slots, name: &[u8]) -> Result<Option<(usize, usize, u32, u8)>> {
+    let mut slot = 0;
+    while slot < slots.count {
+        if (*area.get(slots.bitmap + slot / 8).context("truncated F2FS dentry bitmap")? >> (slot % 8)) & 1 == 0 { slot += 1; continue }
+        let at = slots.entries + slot * DIR_ENTRY;
+        let (ino, len) = (le32(area, at + 4)?, le16(area, at + 8)? as usize);
+        if ino == 0 { slot += 1; continue }
+        let span = len.div_ceil(8).max(1);
+        if slot + span > slots.count { bail!("invalid F2FS dentry length {len}") }
+        let start = slots.names + slot * 8;
+        if area.get(start..start + len).context("truncated F2FS dentry name")? == name {
+            return Ok(Some((slot, span, ino, *area.get(at + 10).context("truncated F2FS dentry")?)))
+        }
+        slot += span;
+    }
+    Ok(None)
+}
+
+fn clear_entry(area: &mut [u8], base: u64, slots: &Slots, slot: usize, span: usize) -> (u64, Vec<u8>) {
+    for bit in slot..slot + span { area[slots.bitmap + bit / 8] &= !(1 << (bit % 8)) }
+    let (first, last) = (slots.bitmap + slot / 8, slots.bitmap + (slot + span - 1) / 8);
+    (base + first as u64, area[first..=last].to_vec())
+}
+
+fn inode_checksum(seed: u32, block: &[u8]) -> Result<u32> {
+    let at = INODE_ADDR + 8;
+    let crc = crc32(crc32(seed, block.get(NODE_FOOTER + 4..NODE_FOOTER + 8).context("truncated F2FS inode")?), &block[68..72]);
+    Ok(crc32(crc32(crc32(crc, &block[..at]), &[0; 4]), &block[at + 4..]))
+}
+
+fn inline_sizes(block: &[u8]) -> Result<(usize, usize)> {
+    let inline = block[3];
+    let extra = if inline & EXTRA_ATTR == 0 { 0 } else { le16(block, INODE_ADDR)? as usize };
+    if extra & 3 != 0 || INODE_ADDR.checked_add(extra).is_none_or(|start| start > INODE_NIDS) {
+        bail!("invalid F2FS extra attribute size {extra}")
+    }
+    let xattrs = if inline & INLINE_XATTR == 0 { 0 } else if inline & EXTRA_ATTR == 0 { 50 } else {
+        let value = le16(block, INODE_ADDR + 2)? as usize; if value == 0 { 50 } else { value }
+    };
+    Ok((extra, xattrs))
+}
+
+fn mapped(block: &[u8], extra: usize, xattrs: usize) -> Result<Mapped> {
+    let start = INODE_ADDR + extra;
+    let end = INODE_NIDS.checked_sub(xattrs.checked_mul(4).context("F2FS inline xattr overflow")?)
+        .filter(|&end| start <= end).context("F2FS inode addresses overlap xattrs")?;
+    let mut blocks = Vec::with_capacity((end - start) / 4);
+    for at in (start..end).step_by(4) { blocks.push(le32(block, at)?); }
+    let mut nids = [0; 5];
+    for (index, at) in (INODE_NIDS..NODE_FOOTER).step_by(4).enumerate() { nids[index] = le32(block, at)?; }
+    Ok(Mapped { blocks, nids })
 }
 
 fn inode(block: &[u8], node: u64, geometry: Geometry) -> Result<Option<File>> {
@@ -271,20 +541,8 @@ fn inode(block: &[u8], node: u64, geometry: Geometry) -> Result<Option<File>> {
     if inline & INLINE_DATA != 0 { return Ok(None) }
     let flags = le32(block, 80)?;
     if flags & (ENCRYPT_FLAG | VERITY_FLAG) != 0 || block[2] & (0x04 | 0x40) != 0 { return Ok(None) }
-    let extra = if inline & EXTRA_ATTR == 0 { 0 } else { le16(block, INODE_ADDR)? as usize };
-    if extra & 3 != 0 || INODE_ADDR.checked_add(extra).is_none_or(|start| start > INODE_NIDS) {
-        bail!("invalid F2FS extra attribute size {extra}")
-    }
-    let xattrs = if inline & INLINE_XATTR == 0 { 0 } else if inline & EXTRA_ATTR == 0 { 50 } else {
-        let value = le16(block, INODE_ADDR + 2)? as usize; if value == 0 { 50 } else { value }
-    };
-    let start = INODE_ADDR + extra;
-    let end = INODE_NIDS.checked_sub(xattrs.checked_mul(4).context("F2FS inline xattr overflow")?)
-        .filter(|&end| start <= end).context("F2FS inode addresses overlap xattrs")?;
-    let mut blocks = Vec::with_capacity((end - start) / 4);
-    for at in (start..end).step_by(4) { blocks.push(le32(block, at)?); }
-    let mut nids = [0; 5];
-    for (index, at) in (INODE_NIDS..NODE_FOOTER).step_by(4).enumerate() { nids[index] = le32(block, at)?; }
+    let (extra, xattrs) = inline_sizes(block)?;
+    let Mapped { blocks, nids } = mapped(block, extra, xattrs)?;
     let data = if flags & COMPRESS_FLAG != 0 {
         if inline & EXTRA_ATTR == 0 { bail!("compressed F2FS inode {nid:#x} has no extra attributes") }
         if extra < 36 || extra & 3 != 0 { bail!("invalid compressed F2FS extra size {extra}") }
@@ -330,6 +588,34 @@ fn files(source: &Blob) -> Result<(Geometry, Vec<File>)> {
     let mut files = current.into_values().collect::<Vec<_>>();
     for file in &mut files { layout.resolve(source, file, &mut cache, &mut nodes)?; }
     Ok((geometry, files))
+}
+
+fn locate(source: &Blob, layout: &Layout, path: &str) -> Result<Option<(u32, u8, Patches)>> {
+    let (mut nat, mut nodes) = (BTreeMap::new(), BTreeMap::new());
+    let mut dir = layout.root; let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let Some((ino, kind, patches)) = layout.lookup(source, dir, part.as_bytes(), &mut nat, &mut nodes)? else { return Ok(None) };
+        if parts.peek().is_none() { return Ok(Some((ino, kind, patches))) }
+        if kind != FT_DIR { return Ok(None) }
+        dir = ino;
+    }
+    Ok(None)
+}
+
+pub fn remove(source: Blob, path: &str) -> Result<Option<Blob>> {
+    if path.split('/').any(|part| matches!(part, "" | "." | "..")) { bail!("invalid F2FS path {path:?}") }
+    let layout = layout(&source)?.context("not an F2FS image")?;
+    let Some((ino, kind, mut patches)) = locate(&source, &layout, path)? else { return Ok(None) };
+    if kind != FT_FILE { bail!("F2FS removal target is not a regular file: {path}") }
+    let mut edit = Edit { source: source.clone(), blocks: BTreeMap::new(), touched: BTreeSet::new() };
+    let freed = layout.unlink_inode(&source, ino, &mut edit)?;
+    patches.extend(edit.patches()?);
+    let output = blob::patch(source, patches)?;
+    let after = self::layout(&output)?.context("F2FS metadata is invalid after removal")?;
+    if locate(&output, &after, path)?.is_some() { bail!("F2FS removal verification failed: {path}") }
+    let mut cache = BTreeMap::new();
+    if freed.iter().any(|&nid| after.nat_entry(&output, nid, &mut cache).map_or(true, |entry| entry != (0, 0))) { bail!("F2FS NAT verification failed: {path}") }
+    Ok(Some(output))
 }
 
 fn read_block(source: &Blob, geometry: Geometry, block: u32) -> Result<Vec<u8>> {

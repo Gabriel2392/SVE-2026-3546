@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 use anyhow::{bail, Context, Result};
 
 use crate::lp;
-use super::{avb, blob::{self, Blob}, boot, codesigner, config::{AvbKind, CodeSignerKind, Config, ImageRule, KeyPolicy}, crypto::Keys, erofs, f2fs, input::ImageSource, stock::Stock, sparse, templates::Catalog};
+use super::{avb, blob::{self, Blob}, boot, codesigner, config::{AvbKind, CodeSignerKind, Config, ImageRule, KeyPolicy}, crypto::Keys, erofs, f2fs, independent, input::ImageSource, stock::Stock, sparse, templates::Catalog};
 
 pub struct Built { pub images: BTreeMap<String, Blob>, pub descriptors: BTreeMap<String, avb::Descriptor> }
 
@@ -148,25 +148,24 @@ fn logical(config: &Config, stock: Blob, name: &str, keys: &Keys) -> Result<(Blo
         .context("logical partition has no AVB integrity descriptor")?;
     let rule = config.android.logical_rules.values().find(|rule| rule.partition == name).with_context(|| format!("no logical rule for {name}"))?;
     let rules = rule.filesystem.as_ref();
-    let changes_data = rules.is_some_and(|rules| rules.discover_firmware || !rules.sign_firmware.is_empty() || !rules.remove.is_empty());
+    let changes_data = rules.is_some_and(|rules| rules.discover_firmware || !rules.sign_firmware.is_empty() || !rules.remove.is_empty() || !rules.remove_if_present.is_empty());
     if !changes_data { return avb::resign_metadata(&template, keys) }
 
     let mut payload = blob::region(stock.clone(), 0, data_size(integrity)?)?;
     if let Some(rules) = rules {
         log!("Processing {name} for firmware files");
         if rules.discover_firmware && f2fs::present(&payload)? {
-            if !rules.preserve_stock.is_empty() || !rules.sign_firmware.is_empty() || !rules.remove.is_empty() {
+            if !rules.preserve_stock.is_empty() || !rules.sign_firmware.is_empty() {
                 bail!("{name}: explicit file edits are unsupported on the F2FS discovery path")
             }
+            payload = independent::remove_files(payload, rules, name)?;
             (payload, _) = f2fs::resign(payload, keys, name)?;
         } else {
         for path in &rules.preserve_stock {
             let data = erofs::read(stock.clone(), path).with_context(|| format!("reading stock {name}:/{path}"))?;
             payload = erofs::replace(payload, path, &data).with_context(|| format!("preserving stock {name}:/{path}"))?;
         }
-        for path in &rules.remove {
-            payload = erofs::remove(payload, path).with_context(|| format!("removing {name}:/{path}"))?;
-        }
+        payload = independent::remove_files(payload, rules, name)?;
         let detected = if rules.discover_firmware {
             erofs::signed_firmware(payload.clone()).with_context(|| format!("discovering signed firmware in {name}"))?
         } else { Vec::new() };

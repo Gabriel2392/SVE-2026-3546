@@ -137,7 +137,7 @@
         "avb": "hashtree",
         "partition": "vendor",
         "synthesize_missing_wrappers": true,
-        "filesystem": {"discover_firmware": true}
+        "filesystem": {"discover_firmware": true, "remove_if_present": ["bin/install-recovery.sh", "etc/init/vendor_flash_recovery.rc"]}
       },
       "odm.img": {
         "codesigner": "none",

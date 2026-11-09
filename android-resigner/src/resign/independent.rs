@@ -152,16 +152,32 @@ fn avb_payload(source: Blob, boundary: Option<u64>) -> Result<Blob> {
     boundary.map_or(Ok(source.clone()), |size| Ok(blob::region(source, 0, size)?))
 }
 
+pub(super) fn remove_files(mut payload: Blob, rule: &Filesystem, description: &str) -> Result<Blob> {
+    if rule.remove.is_empty() && rule.remove_if_present.is_empty() { return Ok(payload) }
+    let f2fs = f2fs::present(&payload)?;
+    for (path, required) in rule.remove.iter().map(|path| (path, true)).chain(rule.remove_if_present.iter().map(|path| (path, false))) {
+        let removed = if f2fs { f2fs::remove(payload.clone(), path) } else { erofs::remove(payload.clone(), path) }
+            .with_context(|| format!("removing {description}:/{path}"))?;
+        match removed {
+            Some(output) => { log!("Removed {description}:/{path}"); payload = output }
+            None if required => bail!("{description}:/{path} not found"),
+            None => {}
+        }
+    }
+    Ok(payload)
+}
+
 fn resign_filesystem(mut payload: Blob, rule: &Filesystem, keys: &Keys, description: &str) -> Result<(Blob, usize)> {
     log!("Processing {description} for firmware files");
     if f2fs::present(&payload)? {
-        if !rule.preserve_stock.is_empty() || !rule.sign_firmware.is_empty() || !rule.remove.is_empty() {
+        if !rule.preserve_stock.is_empty() || !rule.sign_firmware.is_empty() {
             bail!("explicit file edits are unsupported for independent F2FS signing")
         }
+        payload = remove_files(payload, rule, description)?;
         return if rule.discover_firmware { f2fs::resign(payload, keys, description) } else { Ok((payload, 0)) }
     }
     if !rule.preserve_stock.is_empty() { bail!("independent signing cannot preserve files without a separate stock filesystem") }
-    for path in &rule.remove { payload = erofs::remove(payload, path)?; }
+    payload = remove_files(payload, rule, description)?;
     let detected = if rule.discover_firmware { erofs::signed_firmware(payload.clone())? } else { Vec::new() };
     let mut firmware = detected.into_iter().map(|file| (file.path, (file.ranges, file.data))).collect::<BTreeMap<_, _>>();
     for path in &rule.sign_firmware {

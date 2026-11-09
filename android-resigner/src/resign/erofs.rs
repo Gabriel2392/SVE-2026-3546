@@ -41,7 +41,7 @@ fn sb_crc(source: &Blob, block: u64) -> Result<(u32, u32)> {
 }
 
 #[derive(Clone, Copy)]
-struct Inode { nid: u64, at: u64, layout: u8, mode: u16, size: u64, data: u64, header: u64, xattrs: u64 }
+struct Inode { nid: u64, at: u64, layout: u8, mode: u16, links: u32, size: u64, data: u64, header: u64, xattrs: u64 }
 
 #[derive(Clone)]
 struct Fs { source: Blob, block: u64, blocks: u64, block_bits: u8, dir_block: usize, meta: u64, root: u64, packed: u64, zero_padding: bool, checksum: bool, fragments: bool, ztail: bool, bit48: bool }
@@ -140,8 +140,11 @@ impl Fs {
         let xattrs = if xattr_count == 0 { 0 } else { 12 + (xattr_count - 1) * 4 };
         let layout = ((format >> 1) & 7) as u8;
         if !matches!(layout, PLAIN | FULL | INLINE | COMPACT | CHUNK) { bail!("unsupported EROFS inode layout {layout}") }
+        let mode = u16le(&data, 4)?;
+        let links = if header == 64 { u32le(&data, 40)? }
+            else if mode & 0o170000 != 0o040000 && format & 0x10 != 0 { 1 } else { u16le(&data, 6)? as u32 };
         let high = if self.bit48 && (header == 64 || format & 0x10 != 0) { u16le(&data, 6)? as u64 } else { 0 };
-        Ok(Inode { nid, at, layout, mode: u16le(&data, 4)?, size, data: u32le(&data, 16)? as u64 | high << 32, header, xattrs })
+        Ok(Inode { nid, at, layout, mode, links, size, data: u32le(&data, 16)? as u64 | high << 32, header, xattrs })
     }
 
     fn chunks(&self, inode: Inode) -> Result<Vec<Chunk>> {
@@ -619,6 +622,17 @@ impl Fs {
         Ok(output)
     }
 
+    fn shrink(&self, inode: Inode, len: u64) -> Result<Blob> {
+        let size = if inode.header == 32 { u32::try_from(len).context("EROFS compact inode size overflow")?.to_le_bytes().to_vec() }
+            else { len.to_le_bytes().to_vec() };
+        let mut patches = vec![(inode.at + 8, size)];
+        if inode.layout == INLINE && len % self.block == 0 {
+            let mut format = [0; 2]; self.source.read_exact_at(inode.at, &mut format)?;
+            patches.push((inode.at, (u16::from_le_bytes(format) & !0x0e).to_le_bytes().to_vec()));
+        }
+        self.finish(blob::patch(self.source.clone(), patches)?)
+    }
+
     fn clone_plain(&self, inode: Inode, data: &[u8]) -> Result<Blob> {
         if data.len() as u64 > MAX_FILE { bail!("EROFS file exceeds {MAX_FILE} bytes") }
         let count = u64::try_from(data.len().div_ceil(self.block as usize)).context("EROFS block count overflow")?;
@@ -729,27 +743,60 @@ impl Fs {
         self.finish(blob::patch(self.source.clone(), patches)?)
     }
 
-    fn unlink(&self, path: &str) -> Result<Blob> {
+    fn unlink(&self, path: &str) -> Result<Option<Blob>> {
         valid_path(path)?;
         let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path));
-        let parent = if parent_path.is_empty() { self.inode(self.root)? } else { self.find(parent_path)? };
+        let parent = if parent_path.is_empty() { Some(self.inode(self.root)?) } else { self.find_opt(parent_path)? };
+        let Some(parent) = parent else { return Ok(None) };
         if parent.mode & 0o170000 != 0o040000 { bail!("EROFS parent of {path:?} is not a directory") }
-        let old = self.read_inode(parent)?; let mut new = old.clone(); let mut target = None;
-        for (index, block) in old.chunks(self.dir_block).enumerate() {
-            let mut entries = dirents(block)?;
+        let old = self.read_inode(parent)?;
+        let sizes = old.chunks(self.dir_block).map(<[u8]>::len).collect::<Vec<_>>();
+        let mut blocks = old.chunks(self.dir_block).map(dirents).collect::<Result<Vec<_>>>()?;
+        let mut target = None; let mut dirty = BTreeSet::new();
+        for (index, entries) in blocks.iter_mut().enumerate() {
             if let Some(at) = entries.iter().position(|entry| entry.name == name.as_bytes()) {
                 let nid = u64::from_le_bytes(entries[at].raw[..8].try_into().unwrap());
                 if target.replace(nid).is_some() { bail!("duplicate EROFS path: {path}") }
-                entries.remove(at);
-                let encoded = encode_dirents(&entries, block.len())?; let start = index * self.dir_block;
-                new[start..start + block.len()].copy_from_slice(&encoded);
+                entries.remove(at); dirty.insert(index);
             }
         }
-        let inode = self.inode(target.with_context(|| format!("EROFS path not found: {path}"))?)?;
+        let Some(target) = target else { return Ok(None) };
+        let inode = self.inode(target)?;
         if inode.mode & 0o170000 != 0o100000 { bail!("EROFS removal target is not a regular file: {path}") }
-        let output = self.rewrite(parent, &old, &mut new, &mut None, None)?;
+        let last = blocks.len().checked_sub(1).context("empty EROFS directory")?; let mut keep = old.len();
+        if blocks[last].is_empty() {
+            if last == 0 { keep = 0; dirty.clear(); }
+            else {
+                let moved = (blocks[last - 1].len() > 1).then(|| blocks[last - 1].pop().unwrap());
+                match moved {
+                    Some(entry) if 12 + entry.name.len() <= sizes[last] => {
+                        blocks[last].push(entry); dirty.insert(last - 1);
+                    }
+                    moved => {
+                        if let Some(entry) = moved { blocks[last - 1].push(entry); }
+                        keep -= sizes[last]; dirty.remove(&last);
+                    }
+                }
+            }
+        }
+        let mut new = old.clone();
+        for &index in &dirty {
+            let start = index * self.dir_block;
+            new[start..start + sizes[index]].copy_from_slice(&encode_dirents(&blocks[index], sizes[index])?);
+        }
+        let mut output = if keep == old.len() { self.rewrite(parent, &old, &mut new, &mut None, None)? }
+            else if matches!(parent.layout, PLAIN | INLINE) {
+                let output = self.rewrite(parent, &old, &mut new, &mut None, None)?;
+                let fs = Fs::open(output)?; fs.shrink(fs.inode(parent.nid)?, keep as u64)?
+            } else { self.clone_plain(parent, &new[..keep])? };
+        if inode.links > 1 {
+            let (at, links) = if inode.header == 32 {
+                (inode.at + 6, u16::try_from(inode.links - 1).context("EROFS link count overflow")?.to_le_bytes().to_vec())
+            } else { (inode.at + 40, (inode.links - 1).to_le_bytes().to_vec()) };
+            output = self.finish(blob::patch(output, vec![(at, links)])?)?;
+        }
         if Fs::open(output.clone())?.find_opt(path)?.is_some() { bail!("EROFS removal verification failed: {path}") }
-        Ok(output)
+        Ok(Some(output))
     }
 }
 
@@ -812,4 +859,4 @@ pub fn replace_signed(source: Blob, files: &mut [(String, Vec<u8>)], keys: &Keys
     replace_files(source, files, Some(keys))
 }
 
-pub fn remove(source: Blob, path: &str) -> Result<Blob> { Fs::open(source)?.unlink(path) }
+pub fn remove(source: Blob, path: &str) -> Result<Option<Blob>> { Fs::open(source)?.unlink(path) }
