@@ -388,8 +388,8 @@ pub fn update_ap(o: UpdateApOptions) -> Result<PathBuf> {
                 targets.push((part.clone(), aosp.layout().partitions[part].group.clone(), image.len()?, image));
             }
             if !signed_logical.is_empty() { bail!("unexpected signed AOSP logical images: {:?}", signed_logical.keys().collect::<Vec<_>>()) }
-            let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, targets)?;
-            if super_image.metadata.device_size() != android::super_device_size(&base, &cfg)? { bail!("AOSP super device size differs from base super") }
+            let device_size = android::super_device_size(&base, &cfg)?;
+            let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, device_size, targets)?;
             let sparse = sparse::encode(super_image.raw, 4096)?;
             let seed = aosp_catalog.as_ref().context("AOSP catalog is missing")?.sparse_seed(cfg.android.st2_key_type, 4096)?;
             let image = codesigner::sign_sparse(sparse, &seed, super_name, &keys)?;
@@ -695,8 +695,8 @@ pub fn run(options: RunOptions) -> Result<PathBuf> {
                 targets.push((part.clone(), aosp.layout().partitions[part].group.clone(), size, image));
             }
             if !signed.is_empty() { bail!("unexpected signed AOSP logical images: {:?}", signed.keys().collect::<Vec<_>>()) }
-            let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, targets)?;
-            if super_image.metadata.device_size() != android::super_device_size(&input, &config)? { bail!("AOSP super device size differs from stock super") }
+            let device_size = android::super_device_size(&input, &config)?;
+            let super_image = crate::lp::build_super(&aosp.empty_super()?, &aosp.layout().groups, device_size, targets)?;
             let seed = aosp_catalog.as_ref().context("AOSP catalog is missing")?.sparse_seed(config.android.st2_key_type, 4096)?;
             let image = codesigner::stage_sparse(super_image.raw, &seed, &config.android.super_image, &keys)?;
             input.replace(&config.android.super_image, image)?;

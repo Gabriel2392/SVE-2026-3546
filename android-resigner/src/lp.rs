@@ -248,7 +248,8 @@ fn aligned(value: u64, alignment: u32, offset: u32) -> Result<u64> {
     value.checked_add(delta).context("LP extent alignment overflow")
 }
 
-pub fn build_super(empty: &[u8], expected_groups: &BTreeMap<String, u64>, targets: Vec<(String, String, u64, Arc<dyn ReadAt>)>) -> Result<BuiltSuper> {
+pub fn build_super(empty: &[u8], expected_groups: &BTreeMap<String, u64>, device_size: u64,
+                   targets: Vec<(String, String, u64, Arc<dyn ReadAt>)>) -> Result<BuiltSuper> {
     if empty.len() < GEOMETRY_SIZE as usize + 128 { bail!("compact LP metadata is too short") }
     let geometry = geometry_at(empty, 0)?;
     let header_at = GEOMETRY_SIZE as usize;
@@ -281,8 +282,13 @@ pub fn build_super(empty: &[u8], expected_groups: &BTreeMap<String, u64>, target
         groups.push((name(&entry[..36])?, u64le(&entry, 40)?, entry));
     }
     let device_at = device_table.offset as usize;
-    let device_raw = tables.get(device_at..device_at + device_table.size as usize).context("short compact LP block device")?.to_vec();
-    let device = Device { first: u64le(&device_raw, 0)?, alignment: u32le(&device_raw, 8)?, offset: u32le(&device_raw, 12)?, size: u64le(&device_raw, 16)? };
+    let mut device_raw = tables.get(device_at..device_at + device_table.size as usize).context("short compact LP block device")?.to_vec();
+    let aosp_size = u64le(&device_raw, 16)?;
+    if device_size < aosp_size {
+        bail!("AOSP super device ({aosp_size} bytes) is larger than stock super ({device_size} bytes)")
+    }
+    set64(&mut device_raw, 16, device_size)?;
+    let device = Device { first: u64le(&device_raw, 0)?, alignment: u32le(&device_raw, 8)?, offset: u32le(&device_raw, 12)?, size: device_size };
     let prefix_size = RESERVED.checked_add((GEOMETRY_SIZE + geometry.max as u64 * geometry.slots as u64).checked_mul(2).context("LP metadata size overflow")?).context("LP metadata size overflow")?;
     if device.size > 16 << 30 || device.first.checked_mul(SECTOR).is_none_or(|first| first < prefix_size || first >= device.size) { bail!("invalid compact LP block device") }
     for (name, maximum) in expected_groups {
