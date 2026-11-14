@@ -2,6 +2,25 @@
 
 This PoC uses it to fuse Secure Boot KEY2 and flash re-signed bootloader files on s5e8825 and s5e9925.
 
+## Exynos SoCs where it is possible to easily fuse KEY2 with this SVE:
+
+- s5e8365
+- s5e8535
+- s5e8825 (Implemented in this repo)
+- s5e8835
+- s5e8845
+- s5e8855
+- s5e9830
+- s5e9840
+- s5e9925 (Implemented in this repo)
+- s5e9945
+- s5e9955
+- Probably more
+
+## Possible but not straight forward:
+- s5e8865
+- s5e9965
+
 ## Demo
 
 ![Demo](AUTH-preview.gif)
